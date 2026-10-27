@@ -10,8 +10,10 @@ outputs/
 # Raw / processed data are not tracked
 data/raw/*
 data/processed/*
+data/hcp/
 !data/*/.gitkeep
 
 # Original zip drops and reference papers (copyrighted, local only)
 *.zip
 doc/papers/
+doc/hcp/
