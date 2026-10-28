@@ -17,6 +17,32 @@ area / volume vs BMI. All inputs are already here; no imaging download needed.
 Functional connectivity (route B, neuroasd-style FC → GNN) comes later and
 needs resting-state fMRI.
 
+## Processed (`processed/`, gitignored)
+
+Build with:
+
+```bash
+uv run python data/scripts/build_hcp_structural.py
+```
+
+Load with `neurobmi.data.load_structural()`.
+
+| File | Contents |
+|------|----------|
+| `hcp_structural_manifest.csv` | One row per included subject: `subject`, `family_id`, `fold` (0–4), `bmi`, `bmi_class`, `obese` (1 obese / 0 normal / blank otherwise), `age`, `sex` (1 M, 0 F), `icv`, `total_gm_vol`, `total_wm_vol`, `qc_issue`, `zygosity`, `race`, `ethnicity`, `education_years`, `income_bracket`, `handedness`, `bp_systolic`, `bp_diastolic`, `hba1c`, `rs_fmri_runs` |
+| `hcp_structural_features.npy` | float32 (1040, 225), rows in manifest order |
+| `hcp_structural_features.json` | Feature names and column ranges: `thickness` 0–68, `area` 68–136, `gray_volume` 136–204 (Desikan-Killiany, L then R), `subcortical_volume` 204–225 (10 bilateral structures + brain stem) |
+| `hcp_structural_build.json` | Inclusion counts and fold settings |
+
+Inclusion: 1206 subjects → 1113 with FreeSurfer → 1112 with BMI → **1040** after
+dropping `QC_Issue` A / B (pass `--keep-qc-issues` to keep them). Folds are
+5-fold `StratifiedGroupKFold` (seed 0) grouped by `family_id` and stratified on
+`bmi_class`; no family spans two folds. Covariates are raw — regress or adjust
+for age, sex and ICV inside each training fold, never on the full set.
+
+The released FreeSurfer header repeats `FS_L_Cerebellum_Cort_*`; the build
+script renames the second occurrence (right hemisphere) to `FS_R_Cerebellum_Cort_*`.
+
 ## Have (`hcp/`, as of 2026-10-26)
 
 ### Keep

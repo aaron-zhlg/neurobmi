@@ -1,7 +1,7 @@
 [project]
 name = "neurobmi"
 version = "0.1.0"
-description = "neurobmi — fMRI brain-region features and obesity / BMI"
+description = "neurobmi â€” fMRI brain-region features and obesity / BMI"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

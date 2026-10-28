@@ -4,7 +4,7 @@ __pycache__/
 .DS_Store
 outputs/
 
-# Secrets — never commit real API keys
+# Secrets â€” never commit real API keys
 .env
 
 # Raw / processed data are not tracked
