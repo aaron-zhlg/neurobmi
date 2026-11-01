@@ -5,13 +5,14 @@
   "plausibility_r2": 0.15,
   "screen": {
     "max_drop": 0.01,
-    "timeout_seconds": 600
+    "timeout_seconds": 300
   },
   "confirm": {
     "repeats": 10,
     "min_delta": 0.005,
     "max_p": 0.1,
-    "timeout_seconds": 3600
+    "timeout_seconds": 1800,
+    "workers": 5
   },
   "smoke": {
     "timeout_seconds": 120

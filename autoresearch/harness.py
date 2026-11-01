@@ -28,6 +28,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -184,25 +185,45 @@ def scrub_error(exc: BaseException, candidate_path: Path) -> str:
 
 
 def run_stage(candidate_path: Path, stage: str, seeds: list[int] | None = None, timeout: int | None = None) -> dict:
-    """Run one stage in a child process. Returns {"ok", "folds"|"error", "summary"}."""
+    """Run one stage in child processes (seeds split across `workers`).
+
+    Returns {"ok", "folds"|"error", "summary", "seconds"}. The timeout applies to
+    the whole stage, i.e. to every worker at once.
+    """
     gates = load_gates()
     seeds = seeds or [0]
     timeout = timeout or gates[stage]["timeout_seconds"]
-    cmd = [sys.executable, "-m", "autoresearch.harness", "child", str(candidate_path), stage, ",".join(map(str, seeds))]
-    env = {**os.environ, "OMP_NUM_THREADS": CHILD_THREADS, "OPENBLAS_NUM_THREADS": CHILD_THREADS,
-           "MKL_NUM_THREADS": CHILD_THREADS, "PYTHONHASHSEED": "0"}
+    workers = max(1, min(len(seeds), gates[stage].get("workers", 1)))
+    threads = CHILD_THREADS if workers == 1 else "1"
+    env = {**os.environ, "OMP_NUM_THREADS": threads, "OPENBLAS_NUM_THREADS": threads,
+           "MKL_NUM_THREADS": threads, "PYTHONHASHSEED": "0"}
     env.pop("DEEPSEEK_API_KEY", None)
+    chunks = [seeds[i::workers] for i in range(workers)]
+    started = time.monotonic()
+    procs = [subprocess.Popen([sys.executable, "-m", "autoresearch.harness", "child", str(candidate_path), stage,
+                               ",".join(map(str, chunk))], cwd=ROOT, env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, text=True) for chunk in chunks]
+    outputs = []
     try:
-        proc = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, timeout=timeout)
+        for proc in procs:
+            remaining = max(1.0, timeout - (time.monotonic() - started))
+            outputs.append((proc.communicate(timeout=remaining)[0], proc.returncode))
     except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"Timeout: stage {stage} exceeded {timeout}s"}
-    lines = [l for l in proc.stdout.splitlines() if l.startswith("AUTORESEARCH_RESULT ")]
-    if not lines:
-        return {"ok": False, "error": f"child exited with code {proc.returncode} without a result"}
-    result = json.loads(lines[-1].removeprefix("AUTORESEARCH_RESULT "))
-    if result["ok"]:
-        result["summary"] = summarize(result["folds"])
-    return result
+        for proc in procs:
+            proc.kill()
+        return {"ok": False, "error": f"Timeout: stage {stage} exceeded {timeout}s "
+                                      f"(make fit_predict faster: smaller grids, fewer inner folds)"}
+    folds = []
+    for stdout, code in outputs:
+        lines = [l for l in stdout.splitlines() if l.startswith("AUTORESEARCH_RESULT ")]
+        if not lines:
+            return {"ok": False, "error": f"child exited with code {code} without a result"}
+        result = json.loads(lines[-1].removeprefix("AUTORESEARCH_RESULT "))
+        if not result["ok"]:
+            return result
+        folds += result["folds"]
+    folds.sort(key=lambda f: (f["seed"], f["fold"]))
+    return {"ok": True, "folds": folds, "summary": summarize(folds), "seconds": round(time.monotonic() - started, 1)}
 
 
 def summarize(folds: list[dict]) -> dict[str, float]:

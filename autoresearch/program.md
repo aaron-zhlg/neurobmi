@@ -43,8 +43,10 @@ def fit_predict(train, test) -> np.ndarray   # predicted BMI, one value per test
    `test.X` jointly with `train.X`.
 4. One idea per trial. Keep it small enough to explain in one sentence.
 5. Deterministic: set `random_state` on anything random.
-6. The fit for one fold must finish in well under a minute (the screen
-   stage has a 10-minute budget for 5 folds).
+6. Speed budget: the screen stage (5 folds) must finish within **5 minutes**
+   total, i.e. under ~1 minute per fold including any inner CV. Keep
+   hyperparameter grids small (≤ ~20 combinations) and inner CV at ≤ 5 folds.
+   A timeout counts as a failure.
 
 ## How a candidate is judged
 
