@@ -11,7 +11,7 @@ No LLM decides control flow. State lives in outputs/autoresearch/<tag>/:
 Each new champion is pushed to its own branch autoresearch/<tag>-<idea> (cut
 from origin/main through a temporary worktree) and opened as a PR against main;
 a flagged reviewer verdict makes it a draft. A new tag seeds from the best
-champion of any earlier run scored by the same harness, so runs keep building
+champion of any earlier run (re-scored by the current harness), so runs keep building
 on each other before PRs are merged. The harness appends every scored stage to
 outputs/autoresearch/ledger.jsonl. The repo's own checkout is never modified.
 """
@@ -94,16 +94,17 @@ class Run:
         return state
 
     def _best_seed(self) -> tuple[Path, str]:
-        """Best champion of any earlier run scored by the same harness, else neurobmi/candidate.py.
+        """Best champion of any earlier run (by its recorded screen R²), else neurobmi/candidate.py.
 
-        This is what makes runs build on each other even before their PRs are merged.
+        This is what makes runs build on each other even before their PRs are merged. The
+        seed is re-scored by the current harness in _init_state, so a harness change between
+        runs cannot carry a stale score forward.
         """
         best, best_r2 = (SEED_CANDIDATE, "seed: neurobmi/candidate.py"), float("-inf")
-        hashes = protected_hashes()
         for path in sorted(self.output_root.glob("*/state.json")):
             other = json.loads(path.read_text(encoding="utf-8"))
             champion = other["champion"]
-            if other["tag"] == self.tag or other["hashes"] != hashes or champion["screen_r2"] <= best_r2:
+            if other["tag"] == self.tag or champion["screen_r2"] <= best_r2:
                 continue
             best_r2 = champion["screen_r2"]
             best = (path.parent / champion["path"], f"seed: {other['tag']} #{champion['idx']} {champion['title']}")

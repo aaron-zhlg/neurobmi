@@ -60,7 +60,7 @@ uv run python -m autoresearch final --tag try1 --n-perm 1000
 ```
 
 A run resumes where it stopped (same `--tag`). A **new** tag seeds from the
-best champion of any earlier run scored by the same harness (`--fresh` seeds
+best champion of any earlier run, re-scored by the current harness (`--fresh` seeds
 from `neurobmi/candidate.py` instead), so runs keep improving on each other
 even before their PRs are merged.
 
