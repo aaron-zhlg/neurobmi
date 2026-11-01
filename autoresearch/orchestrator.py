@@ -10,7 +10,8 @@ No LLM decides control flow. State lives in outputs/autoresearch/<tag>/:
 
 Each new champion is pushed to its own branch autoresearch/<tag>-<idea> (cut
 from origin/main through a temporary worktree) and opened as a PR against main;
-a flagged reviewer verdict makes it a draft. A new tag seeds from the best
+a flagged reviewer verdict makes it a draft, and the branch tip is published as a
+GitHub release autoresearch-<tag>-<idea> so the result can be reproduced later. A new tag seeds from the best
 champion of any earlier run (re-scored by the current harness), so runs keep building
 on each other before PRs are merged. The harness appends every scored stage to
 outputs/autoresearch/ledger.jsonl. The repo's own checkout is never modified.
@@ -276,9 +277,62 @@ class Run:
         state["history"][-1]["pr"] = url
         self.save(state)
         self.log(f"[{self.tag}] opened {url}")
+        try:
+            self.log(f"[{self.tag}] released {publish_release(self.tag, idea, pr_url=url)}")
+        except (subprocess.CalledProcessError, OSError) as exc:
+            detail = getattr(exc, "stderr", "") or str(exc)
+            self.log(f"[{self.tag}] could not release #{idea}: {detail.strip()[:300]}")
 
     def _git(self, *args: str, cwd: Path = ROOT) -> str:
         return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+
+def release_name(tag: str, idea: int) -> str:
+    return f"autoresearch-{tag}-{idea:03d}"
+
+
+def publish_release(tag: str, idea: int, pr_url: str | None = None) -> str:
+    """Tag the tip of branch autoresearch/<tag>-<idea> and publish it as a GitHub release.
+
+    The notes come from the branch's own aggregate-only results file, so this also works
+    for champions published before releases existed. Returns the release URL.
+    """
+    branch = f"autoresearch/{tag}-{idea:03d}"
+    run = lambda *cmd: subprocess.run(cmd, cwd=ROOT, check=True, capture_output=True, text=True).stdout
+    run("git", "fetch", "origin", branch)
+    summary = json.loads(run("git", "show", f"FETCH_HEAD:autoresearch/results/{tag}-{idea:03d}.json"))
+    commit = run("git", "rev-parse", "FETCH_HEAD").strip()
+    name = release_name(tag, idea)
+    title = f"{name}: {summary['title']} (screen R2 {summary['screen']['r2_mean']:.4f})"
+    return run("gh", "release", "create", name, "--target", commit, "--title", title,
+               "--notes", release_notes(summary, name, pr_url)).strip()
+
+
+def release_notes(summary: dict, name: str, pr_url: str | None) -> str:
+    screen, confirm = summary["screen"], summary["confirm"]
+    return f"""{summary['hypothesis']}
+
+| stage | R² | r | MAE |
+|---|---|---|---|
+| screen (manifest 5 folds) | {screen['r2_mean']:.4f} ± {screen['r2_std']:.4f} | {screen['r_mean']:.3f} | {screen['mae_mean']:.3f} |
+| confirm (10 × family-grouped 5 folds) | {confirm['r2_mean']:.4f} | | |
+
+Paired against the previous champion ({summary['previous_champion']['title']}): ΔR² = {confirm['delta_mean']:+.4f},
+corrected one-sided p = {confirm['p']:.3g}.{f"{chr(10)}{chr(10)}Pull request: {pr_url}" if pr_url else ""}
+
+### Reproduce
+
+Needs the HCP data built locally (see `data/README.md`).
+
+```bash
+git checkout {name}
+uv sync
+uv run python -m autoresearch score neurobmi/candidate.py --stage confirm
+```
+
+The harness, gates and candidate at this tag are exactly the ones that produced these numbers.
+Only aggregate metrics appear here; no subject-level data.
+"""
 
 
 def pr_body(summary: dict, state: dict) -> str:

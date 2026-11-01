@@ -73,6 +73,24 @@ supersedes, and a reviewer "suspicious" verdict makes the PR a draft. Your
 checkout is never touched and nothing is merged automatically. Pass
 `--no-pr` to keep champions local.
 
+The branch tip is also published as a GitHub release `autoresearch-<tag>-<idea>`
+with the scores and reproduce steps. To reproduce a release:
+
+```bash
+git checkout autoresearch-run2-024
+```
+
+```bash
+uv run python -m autoresearch score neurobmi/candidate.py --stage confirm
+```
+
+`release --tag <tag> --idea <n>` publishes the release for a champion branch
+that does not have one yet.
+
+Changes to autoresearch itself (harness, agents, orchestrator, gates,
+program) go straight to `main`; only agent-found champions get their own
+branches.
+
 Run state lives in `outputs/autoresearch/<tag>/` (gitignored): `state.json`,
 `journal.jsonl`, `llm_log.jsonl`, `champions/NNN.py`. Every scored stage is
 appended to `outputs/autoresearch/ledger.jsonl`.

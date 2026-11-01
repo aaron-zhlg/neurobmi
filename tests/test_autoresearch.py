@@ -176,3 +176,12 @@ def test_pr_body_has_metrics_and_supersedes():
     state = {"history": [{"idx": 0, "title": "ridge", "screen_r2": 0.07, "pr": "https://x/pr/1"}, {"idx": 4}]}
     body = orchestrator.pr_body(summary, state)
     assert "0.0800" in body and "+0.0100" in body and "Supersedes: https://x/pr/1" in body
+
+
+def test_release_notes_show_metrics_and_reproduce_steps():
+    summary = {"title": "t", "hypothesis": "h", "previous_champion": {"title": "p", "screen_r2": 0.07},
+               "screen": {"r2_mean": 0.0846, "r2_std": 0.028, "r_mean": 0.31, "mae_mean": 3.9},
+               "confirm": {"r2_mean": 0.0865, "delta_mean": 0.0169, "p": 0.0178}}
+    notes = orchestrator.release_notes(summary, orchestrator.release_name("run2", 24), "https://example/pr/1")
+    assert "git checkout autoresearch-run2-024" in notes
+    assert "0.0865" in notes and "https://example/pr/1" in notes
