@@ -11,6 +11,8 @@ dependencies = [
     "matplotlib>=3.10.0",
     # LLM client for autoresearch agents (DeepSeek's OpenAI-compatible API).
     "openai>=1.50",
+    "lightgbm>=4.7.0",
+    "xgboost>=3.4.1",
 ]
 
 [dependency-groups]

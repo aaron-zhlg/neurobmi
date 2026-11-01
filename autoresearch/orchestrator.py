@@ -8,7 +8,10 @@ No LLM decides control flow. State lives in outputs/autoresearch/<tag>/:
     champions/NNN.py  every accepted champion
     work/candidate.py the file the coder writes
 
-Each new champion is pushed to its own branch autoresearch/<tag>-<idea> (cut
+Each new champion is first verified without any agent seeing the numbers: a
+family-block permutation test on the development set and one score on the
+locked holdout, which must not fall below the last verified champion's. Only a
+verified champion is pushed to its own branch autoresearch/<tag>-<idea> (cut
 from origin/main through a temporary worktree) and opened as a PR against main;
 a flagged reviewer verdict makes it a draft, and the branch tip is published as a
 GitHub release autoresearch-<tag>-<idea> so the result can be reproduced later. A new tag seeds from the best
@@ -20,6 +23,7 @@ outputs/autoresearch/ledger.jsonl. The repo's own checkout is never modified.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -27,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from autoresearch import agents
+from autoresearch.final import permutation_test
 from autoresearch.harness import (
     ROOT, append_ledger, corrected_paired_ttest, load_gates, protected_hashes, run_stage,
 )
@@ -34,7 +39,7 @@ from autoresearch.llm import LLM
 
 OUTPUT_ROOT = ROOT / "outputs" / "autoresearch"
 SEED_CANDIDATE = ROOT / "neurobmi" / "candidate.py"
-N_SUBJECTS_TRAIN_TEST = (832, 208)  # approximate 5-fold sizes for the corrected t-test
+N_SUBJECTS_TRAIN_TEST = (666, 166)  # approximate 5-fold sizes of the development set, for the corrected t-test
 
 
 @dataclass
@@ -83,13 +88,16 @@ class Run:
         self.log(f"[{self.tag}] scoring {seed_title}")
         screen = self._stage(champion_path, "screen", [0], idea=0, title=seed_title)
         confirm = self._stage(champion_path, "confirm", self._confirm_seeds(), idea=0, title=seed_title)
-        if not (screen["ok"] and confirm["ok"]):
-            raise RuntimeError(f"seed champion failed: {screen.get('error') or confirm.get('error')}")
+        holdout = self._stage(champion_path, "holdout", [0], idea=0, title=seed_title)
+        if not (screen["ok"] and confirm["ok"] and holdout["ok"]):
+            raise RuntimeError(f"seed champion failed: {screen.get('error') or confirm.get('error') or holdout.get('error')}")
         state = {
             "tag": self.tag, "created": time.time(), "hashes": protected_hashes(), "ideas_used": 0,
             "champion": {"idx": 0, "path": str(champion_path.relative_to(self.dir)), "title": seed_title,
                          "screen_r2": screen["summary"]["r2_mean"], "confirm_folds": confirm["folds"]},
             "history": [{"idx": 0, "title": seed_title, "screen_r2": screen["summary"]["r2_mean"]}],
+            # the bar a new champion's holdout score must reach before it gets a PR
+            "verified": {"idx": 0, "title": seed_title, **_holdout_summary(holdout)},
         }
         self.save(state)
         return state
@@ -151,8 +159,10 @@ class Run:
             self.log(f"[{self.tag}] idea {entry['idea']}: {entry['title']!r} -> {entry['outcome']}"
                      + (f" (screen R2 {entry['screen_r2']:.4f})" if entry.get("screen_r2") is not None else "")
                      + (f" [{entry['error']}]" if entry["outcome"] == "agent_error" else ""))
-            if entry["outcome"] == "new_champion" and self.publish:
-                self._publish(state, entry)
+            if entry["outcome"] == "new_champion":
+                verify = self._verify(state, entry)
+                if verify["passed"] and self.publish:
+                    self._publish(state, entry, verify)
             if entry["outcome"] == "quarantined":
                 self.log(f"[{self.tag}] stopping: implausible score needs human review")
                 break
@@ -164,7 +174,10 @@ class Run:
     def trial(self, state: dict, idea: int, budget_left: int) -> dict:
         champion = state["champion"]
         champion_code = (self.dir / champion["path"]).read_text(encoding="utf-8")
-        card = agents.propose(self.llm, champion_code, champion["screen_r2"], self.journal(), budget_left)
+        every = self.gates.get("draft_every")  # every n-th idea must try a different model family
+        required = "draft" if every and idea % every == 0 else None
+        card = agents.propose(self.llm, champion_code, champion["screen_r2"], self.journal(), budget_left,
+                              required_operator=required)
         entry = {"idea": idea, **{k: card[k] for k in ("operator", "title", "hypothesis")},
                  "outcome": None, "screen_r2": None, "attempts": 0}
 
@@ -233,9 +246,43 @@ class Run:
         self.save(state)
 
 
+    # ------------------------------------------------------------ verification
+
+    def _verify(self, state: dict, entry: dict) -> dict:
+        """Permutation test + locked holdout for the new champion. Agents never see the result."""
+        champion = state["champion"]
+        path = self.dir / champion["path"]
+        n_perm = int(os.environ.get("AUTORESEARCH_N_PERM", self.gates["permutation"]["n_perm"]))
+        self.log(f"[{self.tag}] verifying #{entry['idea']}: {n_perm} permutations + locked holdout")
+        perm = permutation_test(path, n_perm, observed_r2=champion["screen_r2"])
+        holdout = self._stage(path, "holdout", [0], entry["idea"], champion["title"])
+        bar = state["verified"]
+        verify = {"permutation": perm, "holdout": _holdout_summary(holdout) if holdout["ok"] else holdout,
+                  "bar": bar, "failed": []}
+        if not perm["ok"]:
+            verify["failed"].append(f"permutation test crashed: {perm['error']}")
+        elif perm["p_value"] >= self.gates["permutation"]["max_p"]:
+            verify["failed"].append(f"permutation p = {perm['p_value']:.3g}")
+        if not holdout["ok"]:
+            verify["failed"].append(f"holdout crashed: {holdout['error']}")
+        else:
+            h = verify["holdout"]
+            if h["r2_ci"][0] <= self.gates["holdout"]["min_ci_low"]:
+                verify["failed"].append(f"holdout R2 CI includes 0 ({h['r2_ci'][0]:.4f})")
+            if h["r2"] < bar["r2"]:
+                verify["failed"].append(f"holdout R2 {h['r2']:.4f} below last verified champion {bar['r2']:.4f}")
+        verify["passed"] = not verify["failed"]
+        state["history"][-1]["verify"] = verify
+        if verify["passed"]:
+            state["verified"] = {"idx": entry["idea"], "title": champion["title"], **verify["holdout"]}
+        self.save(state)
+        self.log(f"[{self.tag}] #{entry['idea']} " + ("verified" if verify["passed"] else
+                                                      "not published: " + "; ".join(verify["failed"])))
+        return verify
+
     # ------------------------------------------------------------ publishing
 
-    def _publish(self, state: dict, entry: dict) -> None:
+    def _publish(self, state: dict, entry: dict, verify: dict) -> None:
         """Open a PR against main for a new champion, on its own branch autoresearch/<tag>-<idea>.
 
         Each PR replaces neurobmi/candidate.py wholesale, so a later PR from the same lineage
@@ -251,6 +298,7 @@ class Run:
             "screen": entry["screen"], "confirm": entry["confirm"],
             "review": {"verdict": entry["review"], "concerns": entry["concerns"], "insight": entry["insight"]},
             "previous_champion": {"title": previous["title"], "screen_r2": previous["screen_r2"]},
+            "verify": verify,
             "lineage": [{k: h[k] for k in ("idx", "title", "screen_r2")} for h in state["history"]],
         }
         try:
@@ -287,6 +335,23 @@ class Run:
         return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
 
 
+def _holdout_summary(result: dict) -> dict:
+    fold = result["folds"][0]
+    return {k: fold[k] for k in ("r2", "r", "mae", "r2_ci", "n_test")}
+
+
+def verification_section(verify: dict) -> str:
+    """Markdown for the checks run before a PR is opened (permutation test, locked holdout)."""
+    perm, h, bar = verify["permutation"], verify["holdout"], verify["bar"]
+    return f"""**Verified before this PR was opened** (no agent saw these numbers):
+
+| check | result | pass rule |
+|---|---|---|
+| family-block permutation test, {perm['n_perm']} shuffles (development set) | p = {perm['p_value']:.3g} (null mean R² {perm['null_mean']:.4f}, 95th pct {perm['null_95th']:.4f}) | p < 0.05 |
+| **locked holdout** ({h['n_test']} subjects, never used for any choice) | **R² = {h['r2']:.4f}**, 95% CI [{h['r2_ci'][0]:.4f}, {h['r2_ci'][1]:.4f}], r = {h['r']:.3f} | CI above 0 |
+| holdout vs last verified champion ({bar['title']}) | {h['r2']:.4f} vs {bar['r2']:.4f} | not lower |"""
+
+
 def release_name(tag: str, idea: int) -> str:
     return f"autoresearch-{tag}-{idea:03d}"
 
@@ -318,7 +383,9 @@ def release_notes(summary: dict, name: str, pr_url: str | None) -> str:
 | confirm (10 × family-grouped 5 folds) | {confirm['r2_mean']:.4f} | | |
 
 Paired against the previous champion ({summary['previous_champion']['title']}): ΔR² = {confirm['delta_mean']:+.4f},
-corrected one-sided p = {confirm['p']:.3g}.{f"{chr(10)}{chr(10)}Pull request: {pr_url}" if pr_url else ""}
+corrected one-sided p = {confirm['p']:.3g}.
+
+{verification_section(summary['verify']) if summary.get('verify') else ""}{f"{chr(10)}{chr(10)}Pull request: {pr_url}" if pr_url else ""}
 
 ### Reproduce
 
@@ -354,6 +421,8 @@ def pr_body(summary: dict, state: dict) -> str:
 ΔR² = {confirm['delta_mean']:+.4f}, corrected one-sided p = {confirm['p']:.3g} over {confirm['n_folds']} folds,
 candidate confirm R² = {confirm['r2_mean']:.4f}.
 
+{verification_section(summary['verify'])}
+
 **Reviewer agent:** {summary['review']['verdict']}{" — " + summary['review']['concerns'] if summary['review']['concerns'] else ""}
 {summary['review']['insight']}
 
@@ -363,7 +432,6 @@ candidate confirm R² = {confirm['r2_mean']:.4f}.
 
 ### Review checklist
 - [ ] The diff fits only on `train` (no test statistics, no fold special-casing)
-- [ ] Run `uv run python -m autoresearch final --tag {summary['tag']}` (family-block permutation test) before merging
 
 Only aggregate metrics appear here; no subject-level data.
 

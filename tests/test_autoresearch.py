@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 os.environ["AUTORESEARCH_SYNTHETIC"] = "1"
+os.environ["AUTORESEARCH_N_PERM"] = "20"  # smallest count that can reach p < 0.05
 
 from autoresearch import agents, harness, orchestrator  # noqa: E402
 from autoresearch.llm import FakeLLM  # noqa: E402
@@ -47,6 +48,9 @@ def write(code: str, call_id: str = "c1") -> dict:
                             "function": {"name": "write_candidate", "arguments": json.dumps({"code": code})}}]}
 
 
+VERIFY = {"permutation": {"ok": True, "n_perm": 200, "p_value": 0.005, "null_mean": 0.0, "null_95th": 0.02},
+          "holdout": {"r2": 0.07, "r": 0.28, "mae": 3.9, "r2_ci": [0.02, 0.12], "n_test": 208},
+          "bar": {"title": "ridge", "r2": 0.06}, "failed": [], "passed": True}
 REVIEW = {"content": json.dumps({"verdict": "ok", "concerns": "", "insight": "noted"})}
 
 
@@ -74,6 +78,43 @@ def test_harness_scores_seed_and_reports_crashes_without_data(tmp_path):
     assert not result["ok"] and "shape" in result["error"] and "SECRET" not in result["error"]
 
 
+def test_holdout_is_locked_and_family_grouped():
+    source = harness.synthetic_source()
+    locked = harness.holdout_mask(source)
+    assert 0.15 < locked.mean() < 0.25
+    assert not set(source.families[locked]) & set(source.families[~locked])
+    dev = source.subset(~locked)
+    assert len(dev.y) == (~locked).sum()
+    holdout = harness.run_stage(SEED, "holdout", [0])
+    fold = holdout["folds"][0]
+    assert holdout["ok"] and fold["n_test"] == locked.sum() and fold["r2_ci"][0] <= fold["r2"] <= fold["r2_ci"][1]
+
+
+def test_permutation_stage_shuffles_whole_families():
+    source = harness.synthetic_source()
+    rng = __import__("numpy").random.default_rng(1)
+    permuted = harness.family_block_permutation(source.families, source.y, rng)
+    assert sorted(permuted) == sorted(source.y) and not (permuted == source.y).all()
+    for fam in set(source.families):
+        members = source.families == fam
+        assert sorted(permuted[members]) in [sorted(source.y[source.families == f]) for f in set(source.families)]
+
+
+def test_champion_failing_holdout_is_not_published(tmp_path):
+    published = []
+    run = orchestrator.Run("v", FakeLLM([card("top ten"), write(GOOD_CODE), REVIEW]), publish=True, fresh=True,
+                           log=lambda *_: None, output_root=tmp_path)
+    run._publish = lambda *args: published.append(args)
+    run.gates.update(plausibility_r2=1.0)
+    run.gates["confirm"]["repeats"] = 2
+    state = run.load()
+    state["verified"]["r2"] = 0.99  # an earlier champion that the holdout cannot beat
+    run.save(state)
+    state = run.run(budget=1)
+    assert run.journal()[0]["outcome"] == "new_champion" and not published
+    assert any("below last verified" in f for f in state["history"][1]["verify"]["failed"])
+
+
 def test_corrected_ttest_detects_consistent_gain():
     champ = [{"seed": s, "fold": k, "r2": 0.05} for s in range(10) for k in range(5)]
     cand = [{"seed": s, "fold": k, "r2": 0.08 + 0.001 * k} for s in range(10) for k in range(5)]
@@ -97,7 +138,10 @@ def test_loop_promotes_debugs_and_logs(tmp_path):
     assert state["champion"]["idx"] == 1 and state["champion"]["screen_r2"] > 0.2
     assert (tmp_path / "t" / "champions" / "001.py").read_text() == GOOD_CODE
     ledger = [json.loads(l) for l in (tmp_path / "ledger.jsonl").read_text().splitlines()]
-    assert {row["stage"] for row in ledger} == {"screen", "confirm"}
+    assert {row["stage"] for row in ledger} == {"screen", "confirm", "holdout"}
+    verify = state["history"][1]["verify"]
+    assert verify["passed"] and verify["permutation"]["p_value"] < 0.05
+    assert state["verified"]["idx"] == 1
     # the debug prompt carries the scrubbed harness error, never data
     assert "shape" in json.dumps(llm.calls[5])
     assert "[0, 1, 2" not in (tmp_path / "llm.jsonl").read_text()
@@ -172,16 +216,18 @@ def test_pr_body_has_metrics_and_supersedes():
                "confirm": {"delta_mean": 0.01, "p": 0.03, "n_folds": 50, "r2_mean": 0.07},
                "review": {"verdict": "ok", "concerns": "", "insight": "good"},
                "previous_champion": {"title": "ridge", "screen_r2": 0.07},
+               "verify": VERIFY,
                "lineage": [{"idx": 0, "title": "ridge", "screen_r2": 0.07}, {"idx": 4, "title": "elastic net", "screen_r2": 0.08}]}
     state = {"history": [{"idx": 0, "title": "ridge", "screen_r2": 0.07, "pr": "https://x/pr/1"}, {"idx": 4}]}
     body = orchestrator.pr_body(summary, state)
     assert "0.0800" in body and "+0.0100" in body and "Supersedes: https://x/pr/1" in body
+    assert "locked holdout" in body and "0.0700" in body
 
 
 def test_release_notes_show_metrics_and_reproduce_steps():
     summary = {"title": "t", "hypothesis": "h", "previous_champion": {"title": "p", "screen_r2": 0.07},
                "screen": {"r2_mean": 0.0846, "r2_std": 0.028, "r_mean": 0.31, "mae_mean": 3.9},
-               "confirm": {"r2_mean": 0.0865, "delta_mean": 0.0169, "p": 0.0178}}
+               "confirm": {"r2_mean": 0.0865, "delta_mean": 0.0169, "p": 0.0178}, "verify": VERIFY}
     notes = orchestrator.release_notes(summary, orchestrator.release_name("run2", 24), "https://example/pr/1")
     assert "git checkout autoresearch-run2-024" in notes
     assert "0.0865" in notes and "https://example/pr/1" in notes

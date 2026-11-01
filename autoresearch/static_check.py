@@ -11,18 +11,19 @@ import ast
 from pathlib import Path
 
 ALLOWED_IMPORT_ROOTS = {
-    "numpy", "scipy", "sklearn", "math", "warnings", "itertools", "functools",
+    "numpy", "scipy", "sklearn", "lightgbm", "xgboost", "math", "warnings", "itertools", "functools",
     "dataclasses", "typing", "collections", "__future__",
 }
 BANNED_CALLS = {
     "open", "exec", "eval", "compile", "__import__", "globals", "locals", "vars",
     "getattr", "setattr", "delattr", "input", "breakpoint", "memoryview",
 }
-# numpy / sklearn entry points that read or write files or fetch data.
+# numpy / sklearn / lightgbm / xgboost entry points that read or write files or fetch data.
 BANNED_ATTRIBUTES = {
     "load", "loadtxt", "genfromtxt", "fromfile", "save", "savez", "savez_compressed", "savetxt",
     "tofile", "memmap", "DataSource", "fetch_openml", "load_svmlight_file", "dump_svmlight_file",
-    "read_csv", "system", "popen",
+    "read_csv", "system", "popen", "save_model", "load_model", "dump_model", "save_binary", "save_config",
+    "load_config", "plot_tree", "plot_importance", "create_tree_digraph",
 }
 REQUIRED_FUNCTION = "fit_predict"
 

@@ -16,5 +16,16 @@
   },
   "smoke": {
     "timeout_seconds": 120
-  }
+  },
+  "permutation": {
+    "n_perm": 200,
+    "max_p": 0.05,
+    "timeout_seconds": 7200,
+    "workers": 8
+  },
+  "holdout": {
+    "timeout_seconds": 600,
+    "min_ci_low": 0.0
+  },
+  "draft_every": 3
 }

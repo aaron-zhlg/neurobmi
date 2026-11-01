@@ -8,10 +8,18 @@ and is run in a child process (`python -m autoresearch.harness child ...`) so a
 candidate cannot patch the harness, and its stdout / stderr never reach an LLM.
 The parent only ever sees per-fold aggregate metrics.
 
+A locked holdout (one fifth of the families, drawn once with HOLDOUT_SEED) is
+set aside before anything else; every development stage sees only the other
+four fifths.
+
 Stages:
-  smoke     synthetic data, checks the interface (no subject data loaded)
-  screen    the manifest's fixed family-grouped 5 folds
-  confirm   `repeats` re-drawn family-grouped 5-fold splits (seeds 1..repeats)
+  smoke        synthetic data, checks the interface (no subject data loaded)
+  screen       fixed family-grouped 5 folds of the development set
+  confirm      `repeats` re-drawn family-grouped 5-fold splits (seeds 1..repeats)
+  permutation  the screen folds with BMI shuffled between same-size families
+               (one permutation per seed), for the null distribution of R²
+  holdout      fit on the whole development set, score once on the locked holdout,
+               with a family-cluster bootstrap CI. Its numbers never reach an agent.
 
 Set AUTORESEARCH_SYNTHETIC=1 to run every stage on synthetic data (tests).
 """
@@ -39,6 +47,8 @@ ROOT = Path(__file__).resolve().parents[1]
 GATES_PATH = Path(__file__).with_name("gates.json")
 PROTECTED_FILES = ("autoresearch/harness.py", "autoresearch/static_check.py", "autoresearch/gates.json")
 N_FOLDS = 5
+HOLDOUT_SEED = 2026
+N_BOOTSTRAP = 2000
 CHILD_THREADS = "4"
 
 
@@ -76,9 +86,12 @@ class Source:
     y: np.ndarray
     families: np.ndarray
     bmi_class: np.ndarray
-    manifest_folds: np.ndarray
     feature_names: list[str]
     feature_groups: dict[str, tuple[int, int]]
+
+    def subset(self, mask: np.ndarray) -> "Source":
+        return Source(self.X[mask], self.covariates[mask], self.y[mask], self.families[mask], self.bmi_class[mask],
+                      self.feature_names, self.feature_groups)
 
 
 def synthetic_source(n: int = 300, seed: int = 0) -> Source:
@@ -89,7 +102,7 @@ def synthetic_source(n: int = 300, seed: int = 0) -> Source:
     families = np.array([f"F{i // 2}" for i in range(n)])
     groups = {"thickness": (0, 68), "area": (68, 136), "gray_volume": (136, 204), "subcortical_volume": (204, 225)}
     return Source(X, cov, y, families, np.digitize(y, [18.5, 25, 30]).astype(str),
-                  np.array([(i // 2) % N_FOLDS for i in range(n)]), [f"f{i}" for i in range(225)], groups)
+                  [f"f{i}" for i in range(225)], groups)
 
 
 def load_source() -> Source:
@@ -105,15 +118,13 @@ def load_source() -> Source:
         y=data.column("bmi"),
         families=data.column("family_id", str),
         bmi_class=data.column("bmi_class", str),
-        manifest_folds=data.column("fold").astype(int),
         feature_names=data.feature_names,
         feature_groups=data.groups,
     )
 
 
-def fold_assignments(source: Source, stage: str, seed: int) -> np.ndarray:
-    if stage in ("smoke", "screen"):
-        return source.manifest_folds
+def grouped_folds(source: Source, seed: int) -> np.ndarray:
+    """Family-grouped, BMI-class-stratified 5-fold assignment."""
     from sklearn.model_selection import StratifiedGroupKFold
 
     folds = np.full(len(source.y), -1)
@@ -121,6 +132,43 @@ def fold_assignments(source: Source, stage: str, seed: int) -> np.ndarray:
     for k, (_, test) in enumerate(splitter.split(source.X, source.bmi_class, source.families)):
         folds[test] = k
     return folds
+
+
+def holdout_mask(source: Source) -> np.ndarray:
+    """The locked holdout: one family-grouped fifth, fixed by HOLDOUT_SEED."""
+    return grouped_folds(source, HOLDOUT_SEED) == 0
+
+
+def fold_assignments(source: Source, stage: str, seed: int) -> np.ndarray:
+    return grouped_folds(source, 0 if stage in ("smoke", "screen", "permutation") else seed)
+
+
+def family_block_permutation(families: np.ndarray, y: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Shuffle y between families of the same size, so whole families move together."""
+    members: dict = {}
+    for i, fam in enumerate(families):
+        members.setdefault(fam, []).append(i)
+    by_size: dict = {}
+    for idx in members.values():
+        by_size.setdefault(len(idx), []).append(idx)
+    out = y.copy()
+    for blocks in by_size.values():
+        order = rng.permutation(len(blocks))
+        for src, dst in zip(blocks, [blocks[o] for o in order]):
+            out[dst] = y[src]
+    return out
+
+
+def cluster_bootstrap_r2(y: np.ndarray, pred: np.ndarray, families: np.ndarray, n: int = N_BOOTSTRAP) -> list[float]:
+    """95% CI of R² resampling whole families with replacement."""
+    rng = np.random.default_rng(0)
+    fams, inverse = np.unique(families, return_inverse=True)
+    members = [np.where(inverse == f)[0] for f in range(len(fams))]
+    scores = []
+    for _ in range(n):
+        idx = np.concatenate([members[f] for f in rng.integers(0, len(fams), len(fams))])
+        scores.append(fold_metrics(y[idx], pred[idx])["r2"])
+    return [float(np.quantile(scores, 0.025)), float(np.quantile(scores, 0.975))]
 
 
 def split(source: Source, idx: np.ndarray, train: bool) -> Split:
@@ -148,21 +196,38 @@ def load_candidate(path: Path):
     return module
 
 
+def _predict(module, source: Source, train_idx: np.ndarray, test_idx: np.ndarray) -> np.ndarray:
+    pred = np.asarray(module.fit_predict(split(source, train_idx, True), split(source, test_idx, False)),
+                      dtype=float).reshape(-1)
+    if pred.shape != (len(test_idx),):
+        raise ValueError(f"fit_predict returned shape {pred.shape}, expected ({len(test_idx)},)")
+    if not np.isfinite(pred).all():
+        raise ValueError("fit_predict returned non-finite predictions")
+    return pred
+
+
 def evaluate(candidate_path: Path, stage: str, seeds: list[int]) -> list[dict]:
     """Per-fold metrics for every seed. Runs in the child process."""
-    source = synthetic_source() if stage == "smoke" else load_source()
+    full = synthetic_source() if stage == "smoke" else load_source()
+    locked = holdout_mask(full)
     module = load_candidate(candidate_path)
+    if stage == "holdout":
+        dev_idx, test_idx = np.where(~locked)[0], np.where(locked)[0]
+        pred = _predict(module, full, dev_idx, test_idx)
+        y = full.y[test_idx]
+        return [{"seed": 0, "fold": 0, "n_test": int(len(test_idx)), **fold_metrics(y, pred),
+                 "r2_ci": cluster_bootstrap_r2(y, pred, full.families[test_idx])}]
+    dev = full if stage == "smoke" else full.subset(~locked)
     folds_out = []
     for seed in seeds:
-        folds = fold_assignments(source, stage, seed)
+        folds, source = fold_assignments(dev, stage, seed), dev
+        if stage == "permutation":
+            permuted = family_block_permutation(dev.families, dev.y, np.random.default_rng(seed))
+            source = Source(dev.X, dev.covariates, permuted, dev.families, dev.bmi_class,
+                            dev.feature_names, dev.feature_groups)
         for k in range(N_FOLDS):
             test_idx, train_idx = np.where(folds == k)[0], np.where(folds != k)[0]
-            pred = np.asarray(module.fit_predict(split(source, train_idx, True), split(source, test_idx, False)),
-                              dtype=float).reshape(-1)
-            if pred.shape != (len(test_idx),):
-                raise ValueError(f"fit_predict returned shape {pred.shape}, expected ({len(test_idx)},)")
-            if not np.isfinite(pred).all():
-                raise ValueError("fit_predict returned non-finite predictions")
+            pred = _predict(module, source, train_idx, test_idx)
             folds_out.append({"seed": seed, "fold": k, "n_test": int(len(test_idx)),
                               **fold_metrics(source.y[test_idx], pred)})
     return folds_out
@@ -277,7 +342,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd", required=True)
     child = sub.add_parser("child")
     child.add_argument("candidate", type=Path)
-    child.add_argument("stage", choices=("smoke", "screen", "confirm"))
+    child.add_argument("stage", choices=("smoke", "screen", "confirm", "permutation", "holdout"))
     child.add_argument("seeds")
     args = parser.parse_args()
     _child(args.candidate.resolve(), args.stage, [int(s) for s in args.seeds.split(",")])

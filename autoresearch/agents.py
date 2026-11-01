@@ -25,7 +25,8 @@ Reply with one JSON object:
 
 CODER_SYSTEM = """You are an ML engineer. You implement one idea as a complete replacement of candidate.py.
 Rules: define fit_predict(train, test) returning a 1-D numpy array of predicted BMI (len(test)).
-Only import numpy, scipy, sklearn, math, warnings, itertools, functools, dataclasses, typing, collections.
+Only import numpy, scipy, sklearn, lightgbm, xgboost, math, warnings, itertools, functools, dataclasses, typing,
+collections. For lightgbm / xgboost pass n_jobs=1 and verbosity off; never save or load models.
 No file / OS / network access, no dunder attributes, no getattr/eval/exec/open. Fit everything on train only.
 Any inner CV must be grouped by train.families. Set random_state on anything random.
 Use write_candidate with the full file contents; it runs the static checks and tells you about violations,
@@ -56,15 +57,18 @@ def journal_digest(journal: list[dict], limit: int = 25) -> str:
     return "\n".join(rows)
 
 
-def propose(llm: LLM, champion_code: str, champion_r2: float, journal: list[dict], budget_left: int) -> dict:
+def propose(llm: LLM, champion_code: str, champion_r2: float, journal: list[dict], budget_left: int,
+            required_operator: str | None = None) -> dict:
+    must = ("\nThis idea MUST be a \"draft\": a model family different from the champion's (see the "
+            "program's list of architectures), not a tweak of it." if required_operator == "draft" else "")
     user = (
         f"# Program\n{PROGRAM_PATH.read_text(encoding='utf-8')}\n\n"
         f"# Champion (screen R2 = {champion_r2:.4f})\n```python\n{champion_code}\n```\n\n"
         f"# Journal of past ideas\n{journal_digest(journal)}\n\n"
-        f"Ideas left in the budget: {budget_left}. Propose the next idea."
+        f"Ideas left in the budget: {budget_left}. Propose the next idea.{must}"
     )
     card = chat_json(llm, "proposer", PROPOSER_SYSTEM, user)
-    card["operator"] = card.get("operator") if card.get("operator") in OPERATORS else "improve"
+    card["operator"] = required_operator or (card.get("operator") if card.get("operator") in OPERATORS else "improve")
     for key in ("title", "hypothesis", "plan"):
         card[key] = str(card.get(key, "")).strip() or "(missing)"
     return card
