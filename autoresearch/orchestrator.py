@@ -7,10 +7,13 @@ No LLM decides control flow. State lives in outputs/autoresearch/<tag>/:
     llm_log.jsonl     every prompt and reply, for auditing
     champions/NNN.py  every accepted champion
     work/candidate.py the file the coder writes
-    git/              worktree on branch autoresearch/<tag>; one commit per champion
 
-The harness appends every scored stage to outputs/autoresearch/ledger.jsonl.
-The repo's own checkout (including neurobmi/candidate.py) is never modified.
+Each new champion is pushed to its own branch autoresearch/<tag>-<idea> (cut
+from origin/main through a temporary worktree) and opened as a PR against main;
+a flagged reviewer verdict makes it a draft. A new tag seeds from the best
+champion of any earlier run scored by the same harness, so runs keep building
+on each other before PRs are merged. The harness appends every scored stage to
+outputs/autoresearch/ledger.jsonl. The repo's own checkout is never modified.
 """
 
 from __future__ import annotations
@@ -37,7 +40,8 @@ N_SUBJECTS_TRAIN_TEST = (832, 208)  # approximate 5-fold sizes for the corrected
 class Run:
     tag: str
     llm: LLM
-    use_git: bool = True
+    publish: bool = True
+    fresh: bool = False  # True: seed from neurobmi/candidate.py instead of the best earlier champion
     log: callable = print
     output_root: Path = OUTPUT_ROOT
 
@@ -73,22 +77,37 @@ class Run:
         (self.dir / "champions").mkdir(exist_ok=True)
         self.work.parent.mkdir(exist_ok=True)
         champion_path = self.dir / "champions" / "000.py"
-        shutil.copy(SEED_CANDIDATE, champion_path)
-        self.log(f"[{self.tag}] scoring seed champion")
-        screen = self._stage(champion_path, "screen", [0], idea=0, title="seed champion")
-        confirm = self._stage(champion_path, "confirm", self._confirm_seeds(), idea=0, title="seed champion")
+        seed_path, seed_title = (SEED_CANDIDATE, "seed: neurobmi/candidate.py") if self.fresh else self._best_seed()
+        shutil.copy(seed_path, champion_path)
+        self.log(f"[{self.tag}] scoring {seed_title}")
+        screen = self._stage(champion_path, "screen", [0], idea=0, title=seed_title)
+        confirm = self._stage(champion_path, "confirm", self._confirm_seeds(), idea=0, title=seed_title)
         if not (screen["ok"] and confirm["ok"]):
             raise RuntimeError(f"seed champion failed: {screen.get('error') or confirm.get('error')}")
         state = {
             "tag": self.tag, "created": time.time(), "hashes": protected_hashes(), "ideas_used": 0,
-            "champion": {"idx": 0, "path": str(champion_path.relative_to(self.dir)), "title": "seed champion",
+            "champion": {"idx": 0, "path": str(champion_path.relative_to(self.dir)), "title": seed_title,
                          "screen_r2": screen["summary"]["r2_mean"], "confirm_folds": confirm["folds"]},
-            "history": [{"idx": 0, "title": "seed champion", "screen_r2": screen["summary"]["r2_mean"]}],
+            "history": [{"idx": 0, "title": seed_title, "screen_r2": screen["summary"]["r2_mean"]}],
         }
-        if self.use_git:
-            self._git_init()
         self.save(state)
         return state
+
+    def _best_seed(self) -> tuple[Path, str]:
+        """Best champion of any earlier run scored by the same harness, else neurobmi/candidate.py.
+
+        This is what makes runs build on each other even before their PRs are merged.
+        """
+        best, best_r2 = (SEED_CANDIDATE, "seed: neurobmi/candidate.py"), float("-inf")
+        hashes = protected_hashes()
+        for path in sorted(self.output_root.glob("*/state.json")):
+            other = json.loads(path.read_text(encoding="utf-8"))
+            champion = other["champion"]
+            if other["tag"] == self.tag or other["hashes"] != hashes or champion["screen_r2"] <= best_r2:
+                continue
+            best_r2 = champion["screen_r2"]
+            best = (path.parent / champion["path"], f"seed: {other['tag']} #{champion['idx']} {champion['title']}")
+        return best
 
     def _confirm_seeds(self) -> list[int]:
         return list(range(1, self.gates["confirm"]["repeats"] + 1))
@@ -127,6 +146,8 @@ class Run:
             self.log(f"[{self.tag}] idea {entry['idea']}: {entry['title']!r} -> {entry['outcome']}"
                      + (f" (screen R2 {entry['screen_r2']:.4f})" if entry.get("screen_r2") is not None else "")
                      + (f" [{entry['error']}]" if entry["outcome"] == "agent_error" else ""))
+            if entry["outcome"] == "new_champion" and self.publish:
+                self._publish(state, entry)
             if entry["outcome"] == "quarantined":
                 self.log(f"[{self.tag}] stopping: implausible score needs human review")
                 break
@@ -165,6 +186,7 @@ class Run:
             return self._finish(entry, card, champion_code, {"error": screen["error"]}, candidate_code)
         r2 = screen["summary"]["r2_mean"]
         entry["screen_r2"] = r2
+        entry["screen"] = screen["summary"]
         results = {"screen": screen["summary"], "champion_screen_r2": champion["screen_r2"]}
         if r2 > self.gates["plausibility_r2"]:
             entry["outcome"] = "quarantined"
@@ -204,32 +226,91 @@ class Run:
                              "screen_r2": screen_r2, "confirm_folds": confirm_folds}
         state["history"].append({"idx": idea, "title": card["title"], "screen_r2": screen_r2})
         self.save(state)
-        if self.use_git:
-            self._git_commit(path, f"autoresearch({self.tag}): #{idea} {card['title']} (screen R2 {screen_r2:.4f})\n\n"
-                                   f"{card['hypothesis']}")
 
-    # ------------------------------------------------------------ git
 
-    @property
-    def _worktree(self) -> Path:
-        return self.dir / "git"
+    # ------------------------------------------------------------ publishing
+
+    def _publish(self, state: dict, entry: dict) -> None:
+        """Open a PR against main for a new champion, on its own branch autoresearch/<tag>-<idea>.
+
+        Each PR replaces neurobmi/candidate.py wholesale, so a later PR from the same lineage
+        supersedes an earlier unmerged one. Failures are logged and never stop the run.
+        """
+        idea = entry["idea"]
+        branch = f"autoresearch/{self.tag}-{idea:03d}"
+        worktree = self.dir / f"git-{idea:03d}"
+        champion = self.dir / state["champion"]["path"]
+        previous = state["history"][-2]
+        summary = {
+            "tag": self.tag, "idea": idea, "title": entry["title"], "hypothesis": entry["hypothesis"],
+            "screen": entry["screen"], "confirm": entry["confirm"],
+            "review": {"verdict": entry["review"], "concerns": entry["concerns"], "insight": entry["insight"]},
+            "previous_champion": {"title": previous["title"], "screen_r2": previous["screen_r2"]},
+            "lineage": [{k: h[k] for k in ("idx", "title", "screen_r2")} for h in state["history"]],
+        }
+        try:
+            self._git("fetch", "origin", "main")
+            self._git("worktree", "add", "-b", branch, str(worktree), "origin/main")
+            try:
+                shutil.copy(champion, worktree / "neurobmi" / "candidate.py")
+                result_file = worktree / "autoresearch" / "results" / f"{self.tag}-{idea:03d}.json"
+                result_file.write_text(json.dumps(agents.rounded(summary), indent=2) + "\n", encoding="utf-8")
+                self._git("add", "neurobmi/candidate.py", str(result_file.relative_to(worktree)), cwd=worktree)
+                title = f"autoresearch({self.tag}) #{idea}: {entry['title']} (screen R2 {entry['screen_r2']:.4f})"
+                self._git("commit", "-m", f"{title}\n\n{entry['hypothesis']}", cwd=worktree)
+                self._git("push", "-u", "origin", branch, cwd=worktree)
+                draft = ["--draft"] if entry["review"] == "suspicious" else []
+                url = subprocess.run(["gh", "pr", "create", "--base", "main", "--head", branch, "--title", title, *draft,
+                                      "--body", pr_body(summary, state)], cwd=worktree, check=True,
+                                     capture_output=True, text=True).stdout.strip()
+            finally:
+                self._git("worktree", "remove", "--force", str(worktree))
+        except (subprocess.CalledProcessError, OSError) as exc:
+            detail = getattr(exc, "stderr", "") or str(exc)
+            self.log(f"[{self.tag}] could not open a PR for #{idea}: {detail.strip()[:300]}")
+            return
+        state["history"][-1]["pr"] = url
+        self.save(state)
+        self.log(f"[{self.tag}] opened {url}")
 
     def _git(self, *args: str, cwd: Path = ROOT) -> str:
         return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout
 
-    def _git_init(self) -> None:
-        if self._worktree.exists():
-            return
-        branch = f"autoresearch/{self.tag}"
-        exists = subprocess.run(["git", "rev-parse", "--verify", "--quiet", branch], cwd=ROOT,
-                                capture_output=True).returncode == 0
-        self._git("worktree", "add", *([] if exists else ["-b", branch]), str(self._worktree),
-                  *([branch] if exists else ["HEAD"]))
 
-    def _git_commit(self, champion_path: Path, message: str) -> None:
-        shutil.copy(champion_path, self._worktree / "neurobmi" / "candidate.py")
-        self._git("add", "neurobmi/candidate.py", cwd=self._worktree)
-        self._git("commit", "-m", message, cwd=self._worktree)
+def pr_body(summary: dict, state: dict) -> str:
+    screen, confirm = summary["screen"], summary["confirm"]
+    prev = summary["previous_champion"]
+    superseded = [h["pr"] for h in state["history"][:-1] if h.get("pr")]
+    lineage = "\n".join(f"{i}. #{h['idx']} {h['title']} — screen R² {h['screen_r2']:.4f}"
+                         for i, h in enumerate(summary["lineage"], 1))
+    return f"""## {summary['title']}
+
+{summary['hypothesis']}
+
+| | screen R² | screen r | screen MAE |
+|---|---|---|---|
+| previous champion: {prev['title']} | {prev['screen_r2']:.4f} | | |
+| **this candidate** | **{screen['r2_mean']:.4f}** ± {screen['r2_std']:.4f} | {screen['r_mean']:.3f} | {screen['mae_mean']:.3f} |
+
+**Confirm stage** (10 re-drawn family-grouped 5-fold splits, paired against the previous champion):
+ΔR² = {confirm['delta_mean']:+.4f}, corrected one-sided p = {confirm['p']:.3g} over {confirm['n_folds']} folds,
+candidate confirm R² = {confirm['r2_mean']:.4f}.
+
+**Reviewer agent:** {summary['review']['verdict']}{" — " + summary['review']['concerns'] if summary['review']['concerns'] else ""}
+{summary['review']['insight']}
+
+### Lineage in run `{summary['tag']}`
+{lineage}
+{chr(10) + "Supersedes: " + ", ".join(superseded) if superseded else ""}
+
+### Review checklist
+- [ ] The diff fits only on `train` (no test statistics, no fold special-casing)
+- [ ] Run `uv run python -m autoresearch final --tag {summary['tag']}` (family-block permutation test) before merging
+
+Only aggregate metrics appear here; no subject-level data.
+
+🤖 Generated by neurobmi autoresearch (DeepSeek agents), harness written with [Claude Code](https://claude.com/claude-code)
+"""
 
 
 def status(tag: str, output_root: Path = OUTPUT_ROOT) -> str:

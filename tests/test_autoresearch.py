@@ -86,7 +86,7 @@ def test_loop_promotes_debugs_and_logs(tmp_path):
         card("top ten features"), write(GOOD_CODE), REVIEW,        # idea 1: improves -> new champion
         card("broken then fixed"), write(CRASHING_CODE), write(GOOD_CODE, "c2"), REVIEW,  # idea 2: debug path
     ], log_path=tmp_path / "llm.jsonl")
-    run = orchestrator.Run("t", llm, use_git=False, log=lambda *_: None, output_root=tmp_path)
+    run = orchestrator.Run("t", llm, publish=False, fresh=True, log=lambda *_: None, output_root=tmp_path)
     run.gates["plausibility_r2"] = 1.0  # synthetic signal is strong
     run.gates["confirm"]["repeats"] = 3
     state = run.run(budget=2)
@@ -105,7 +105,7 @@ def test_loop_promotes_debugs_and_logs(tmp_path):
 
 def test_loop_quarantines_implausible_scores(tmp_path):
     llm = FakeLLM([card("too good"), write(GOOD_CODE), REVIEW])
-    run = orchestrator.Run("q", llm, use_git=False, log=lambda *_: None, output_root=tmp_path)
+    run = orchestrator.Run("q", llm, publish=False, fresh=True, log=lambda *_: None, output_root=tmp_path)
     run.gates["confirm"]["repeats"] = 2
     run.run(budget=3)
     journal = run.journal()
@@ -115,7 +115,7 @@ def test_loop_quarantines_implausible_scores(tmp_path):
 def test_agent_errors_are_journaled_and_stop_the_run(tmp_path):
     bad_json = {"content": "not json"}
     llm = FakeLLM([bad_json] * 9)  # proposer fails 3 times per idea (1 try + 2 retries)
-    run = orchestrator.Run("e", llm, use_git=False, log=lambda *_: None, output_root=tmp_path)
+    run = orchestrator.Run("e", llm, publish=False, fresh=True, log=lambda *_: None, output_root=tmp_path)
     run.gates["confirm"]["repeats"] = 2
     state = run.run(budget=10)
     assert [e["outcome"] for e in run.journal()] == ["agent_error"] * 3
@@ -123,12 +123,12 @@ def test_agent_errors_are_journaled_and_stop_the_run(tmp_path):
 
 
 def test_resume_continues_numbering(tmp_path):
-    run = orchestrator.Run("r", FakeLLM([card("a"), write(GOOD_CODE), REVIEW]), use_git=False,
+    run = orchestrator.Run("r", FakeLLM([card("a"), write(GOOD_CODE), REVIEW]), publish=False, fresh=True,
                            log=lambda *_: None, output_root=tmp_path)
     run.gates.update(plausibility_r2=1.0)
     run.gates["confirm"]["repeats"] = 2
     run.run(budget=1)
-    again = orchestrator.Run("r", FakeLLM([card("b"), write(GOOD_CODE), REVIEW]), use_git=False,
+    again = orchestrator.Run("r", FakeLLM([card("b"), write(GOOD_CODE), REVIEW]), publish=False, fresh=True,
                              log=lambda *_: None, output_root=tmp_path)
     again.gates.update(plausibility_r2=1.0)
     again.gates["confirm"]["repeats"] = 2
@@ -138,7 +138,7 @@ def test_resume_continues_numbering(tmp_path):
 
 def test_resume_refuses_changed_harness(tmp_path):
     llm = FakeLLM([])
-    run = orchestrator.Run("h", llm, use_git=False, log=lambda *_: None, output_root=tmp_path)
+    run = orchestrator.Run("h", llm, publish=False, fresh=True, log=lambda *_: None, output_root=tmp_path)
     run.gates["confirm"]["repeats"] = 2
     state = run.load()
     state["hashes"]["autoresearch/harness.py"] = "0" * 64
@@ -151,3 +151,28 @@ def test_journal_digest_is_compact():
     entry = {"idea": 3, "operator": "draft", "title": "svr", "outcome": "screen_fail", "screen_r2": 0.031,
              "insight": "kernels overfit"}
     assert agents.journal_digest([entry]) == "- #3 [draft] svr: outcome=screen_fail, screen R2=0.0310 — kernels overfit"
+
+
+def test_new_tag_seeds_from_best_earlier_champion(tmp_path):
+    first = orchestrator.Run("a", FakeLLM([card("top ten"), write(GOOD_CODE), REVIEW]), publish=False, fresh=True,
+                             log=lambda *_: None, output_root=tmp_path)
+    first.gates.update(plausibility_r2=1.0)
+    first.gates["confirm"]["repeats"] = 2
+    first.run(budget=1)
+    second = orchestrator.Run("b", FakeLLM([]), publish=False, log=lambda *_: None, output_root=tmp_path)
+    second.gates["confirm"]["repeats"] = 2
+    state = second.load()
+    assert state["champion"]["title"] == "seed: a #1 top ten"
+    assert (tmp_path / "b" / "champions" / "000.py").read_text() == GOOD_CODE
+
+
+def test_pr_body_has_metrics_and_supersedes():
+    summary = {"tag": "t", "idea": 4, "title": "elastic net", "hypothesis": "sparser",
+               "screen": {"r2_mean": 0.08, "r2_std": 0.02, "r_mean": 0.3, "mae_mean": 3.9},
+               "confirm": {"delta_mean": 0.01, "p": 0.03, "n_folds": 50, "r2_mean": 0.07},
+               "review": {"verdict": "ok", "concerns": "", "insight": "good"},
+               "previous_champion": {"title": "ridge", "screen_r2": 0.07},
+               "lineage": [{"idx": 0, "title": "ridge", "screen_r2": 0.07}, {"idx": 4, "title": "elastic net", "screen_r2": 0.08}]}
+    state = {"history": [{"idx": 0, "title": "ridge", "screen_r2": 0.07, "pr": "https://x/pr/1"}, {"idx": 4}]}
+    body = orchestrator.pr_body(summary, state)
+    assert "0.0800" in body and "+0.0100" in body and "Supersedes: https://x/pr/1" in body

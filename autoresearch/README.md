@@ -59,10 +59,19 @@ uv run python -m autoresearch status --tag try1
 uv run python -m autoresearch final --tag try1 --n-perm 1000
 ```
 
-A run resumes where it stopped (same `--tag`). Each new champion is committed
-to the branch `autoresearch/<tag>` through a worktree at
-`outputs/autoresearch/<tag>/git/`; your checkout and `main` are never touched.
-Pass `--no-git` to skip the commits. Review the branch and merge by hand.
+A run resumes where it stopped (same `--tag`). A **new** tag seeds from the
+best champion of any earlier run scored by the same harness (`--fresh` seeds
+from `neurobmi/candidate.py` instead), so runs keep improving on each other
+even before their PRs are merged.
+
+Each new champion gets its own branch `autoresearch/<tag>-<idea>`, cut from
+`origin/main` in a temporary worktree, with `neurobmi/candidate.py` replaced
+and an aggregate-only `autoresearch/results/<tag>-<idea>.json`. The branch is
+pushed and a PR against `main` is opened with the scores, the confirm-stage
+test and the lineage; a later PR from the same lineage lists the ones it
+supersedes, and a reviewer "suspicious" verdict makes the PR a draft. Your
+checkout is never touched and nothing is merged automatically. Pass
+`--no-pr` to keep champions local.
 
 Run state lives in `outputs/autoresearch/<tag>/` (gitignored): `state.json`,
 `journal.jsonl`, `llm_log.jsonl`, `champions/NNN.py`. Every scored stage is

@@ -1,6 +1,6 @@
 """autoresearch CLI.
 
-    uv run python -m autoresearch run --tag try1 [--budget 30] [--no-git]
+    uv run python -m autoresearch run --tag try1 [--budget 30] [--no-pr] [--fresh]
     uv run python -m autoresearch status --tag try1
     uv run python -m autoresearch final --tag try1 [--n-perm 1000]   # human only
 """
@@ -21,7 +21,9 @@ def main() -> None:
     run.add_argument("--tag", required=True)
     run.add_argument("--budget", type=int, default=None, help="total ideas for this tag (default: gates.json)")
     run.add_argument("--model", default=None, help="DeepSeek model id (default: DEEPSEEK_MODEL or deepseek-flash)")
-    run.add_argument("--no-git", action="store_true", help="do not commit champions to autoresearch/<tag>")
+    run.add_argument("--no-pr", action="store_true", help="do not push a branch and open a PR per new champion")
+    run.add_argument("--fresh", action="store_true",
+                     help="seed from neurobmi/candidate.py instead of the best champion of earlier runs")
     st = sub.add_parser("status", help="summarize a run")
     st.add_argument("--tag", required=True)
     fin = sub.add_parser("final", help="family-block permutation test of a run's champion (human only)")
@@ -33,7 +35,7 @@ def main() -> None:
         from autoresearch.llm import DeepSeekLLM
 
         llm = DeepSeekLLM(model=args.model, log_path=orchestrator.OUTPUT_ROOT / args.tag / "llm_log.jsonl")
-        orchestrator.Run(args.tag, llm, use_git=not args.no_git).run(args.budget)
+        orchestrator.Run(args.tag, llm, publish=not args.no_pr, fresh=args.fresh).run(args.budget)
         print(orchestrator.status(args.tag))
     elif args.cmd == "status":
         print(orchestrator.status(args.tag))
