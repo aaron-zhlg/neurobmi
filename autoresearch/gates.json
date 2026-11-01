@@ -1,0 +1,19 @@
+{
+  "primary_metric": "r2",
+  "idea_budget": 30,
+  "debug_attempts": 3,
+  "plausibility_r2": 0.15,
+  "screen": {
+    "max_drop": 0.01,
+    "timeout_seconds": 600
+  },
+  "confirm": {
+    "repeats": 10,
+    "min_delta": 0.005,
+    "max_p": 0.1,
+    "timeout_seconds": 3600
+  },
+  "smoke": {
+    "timeout_seconds": 120
+  }
+}

@@ -1,19 +1,20 @@
 [project]
 name = "neurobmi"
 version = "0.1.0"
-description = "neurobmi — fMRI brain-region features and obesity / BMI"
+description = "neurobmi — brain-region features and obesity / BMI"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.5.2",
+    "scipy>=1.14",
     "scikit-learn>=1.9.0",
     "matplotlib>=3.10.0",
-    # Multi-agent framework powering autoresearch/loop (lead + coder / linter / experimenter).
-    "orchestra-agents",
+    # LLM client for autoresearch agents (DeepSeek's OpenAI-compatible API).
+    "openai>=1.50",
 ]
 
-[tool.uv.sources]
-orchestra-agents = { git = "https://github.com/aaron-zhlg/orchestra", branch = "main" }
+[dependency-groups]
+dev = ["pytest>=8"]
 
 [build-system]
 requires = ["hatchling"]
@@ -21,3 +22,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["neurobmi", "autoresearch"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

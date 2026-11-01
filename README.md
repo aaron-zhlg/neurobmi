@@ -1,31 +1,35 @@
 # neurobmi
 
-Resting-state fMRI brain-region features and obesity / BMI. Sister project of
-`../neuroasd` (fMRI vs ASD); reuses its autoresearch multi-agent framework.
+Brain-region features and obesity / BMI in HCP Young Adult. Sister project of
+`../neuroasd` (fMRI vs ASD).
 
-> Scaffold only. Task definition, data, and code are still to be decided.
+- **Data**: FreeSurfer regional thickness, area, gray volume and subcortical
+  volumes for 1040 HCP-YA subjects, BMI from the restricted table, family-grouped
+  5 folds. See [data/README.md](data/README.md).
+- **Baseline**: ridge on all 225 features, age / sex / ICV regressed out within
+  the training fold: R² ≈ 0.05–0.06, obese vs normal AUC ≈ 0.65, in line with
+  the literature ([reports/](reports/)).
+- **Autoresearch**: DeepSeek agents propose and test model ideas against a
+  fixed harness. See [autoresearch/README.md](autoresearch/README.md).
 
 ## Layout
 
 ```text
 neurobmi/
-??? neurobmi/            scored model and feature helpers (fit_predict lives here)
-??? autoresearch/        trial harness + gates + multi-agent loop (from neuroasd)
-?   ??? loop/            lead / coder / linter / experimenter
-?   ??? results/         result.json of trials that passed
-??? data/
-?   ??? raw/             original downloads (gitignored)
-?   ??? processed/       harness-ready manifest + features (gitignored)
-?   ??? scripts/         raw ? processed build scripts
-??? experiments/         frozen published results
-??? scripts/             shell entry points
-??? doc/papers/          reference papers, local only (gitignored)
-??? outputs/             local runs, ledger, loop workspace (gitignored)
+├── neurobmi/            data loader, linear baseline, seed candidate.py
+├── autoresearch/        harness, static checks, agents, orchestrator, CLI
+├── data/                raw / processed data (gitignored) and build scripts
+├── reports/             literature review
+├── research_notes/      notes behind the review
+├── tests/               offline tests (synthetic data, scripted LLM)
+├── experiments/         frozen published results
+└── outputs/             local runs, ledger, autoresearch workspaces (gitignored)
 ```
 
-## Open questions
+```bash
+uv sync
+```
 
-- Dataset: which cohort, which atlas / region features, how many sites.
-- Task: obese vs non-obese classification, or BMI regression.
-- Validation: site-held-out (like neuroasd) or repeated k-fold if single site.
-- Confounds: head motion correlates with BMI and must not be a feature.
+```bash
+uv run pytest
+```

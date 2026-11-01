@@ -1,20 +1,80 @@
 # Autoresearch
 
-To be ported from `../neuroasd/autoresearch` once the dataset and task are fixed.
+LLM agents propose, implement and test model ideas for BMI prediction; a
+fixed harness decides what is kept. The design follows Karpathy's
+autoresearch (one editable file, fixed evaluator, keep or revert), AIDE
+(draft / improve / debug operators, compressed journal), AlphaEvolve
+(human-owned evaluator, cheap-to-expensive cascade) and the MLE-bench lessons
+on validation overfitting (separate confirmation stage, idea budget, final
+check only a human can run).
 
-Planned files (same roles as neuroasd):
+```text
+ program.md ─┐
+ champion    ├─► Proposer ─► Coder ─► static check ─► smoke ─► screen ─► confirm ─► new champion?
+ journal ────┘     (idea)    (code)   (AST rules)    (synthetic) (5 fold)  (10×5 fold,     │
+       ▲                       ▲ debug ≤ 3 on failure                       paired t-test)  │
+       └──────────── Reviewer: verdict + insight ◄─────────────────────────────────────────┘
+```
 
-| File | Role |
-|------|------|
-| `program.md` | Rules the agents read before each trial |
-| `gates.json` | Stage thresholds and the reference to beat |
-| `trial.py` | Harness: data, folds, metrics; calls `neurobmi.model.fit_predict` |
-| `run_trial.sh` | Branch lifecycle for one trial |
-| `loop/orchestrator.py` | Lead: plan ? dispatch one worker ? evaluate |
-| `loop/coder.py` | One mechanism per turn under `neurobmi/` |
-| `loop/linter.py` | Mechanical PASS/FAIL + smoke check |
-| `loop/experimenter.py` | Run the required stage, write an insight |
-| `loop/workspace.py` | Session state and `next_role()` |
-| `loop/protocol.py` | Leak guards |
-| `loop/promote.py` | Review branch + score-first PR |
-| `loop/check_loop.py` | No-LLM state-machine checks |
+The control flow is plain Python (`orchestrator.py`); no LLM decides what
+runs next.
+
+## Trust zones
+
+| Zone | Files | Agents |
+|------|-------|--------|
+| Evaluator | `harness.py`, `static_check.py`, `gates.json` | Never edit or read; SHA-256 checked before every idea, a changed hash stops the run |
+| Candidate | `outputs/autoresearch/<tag>/work/candidate.py` | The Coder's only write target (`write_candidate` tool, static checks applied on write) |
+| Context | `program.md`, champion code, journal digest | Read-only |
+| Data | `data/hcp/`, `data/processed/` | **Never sent to the LLM.** Candidates run in a child process; only per-fold aggregate metrics come back, stdout is discarded and error messages are scrubbed to the exception, its message (long number runs removed) and candidate-file lines |
+
+Every prompt and reply is logged to `outputs/autoresearch/<tag>/llm_log.jsonl`
+so a run can be audited for what left the machine.
+
+## Stages (`gates.json`)
+
+| Stage | Data | Pass rule |
+|-------|------|-----------|
+| static check | AST of the file | allowed imports only (numpy, scipy, sklearn, stdlib math / functional helpers); no `open` / `eval` / `getattr` / dunders / path literals / numpy file I/O |
+| smoke | synthetic, 300 rows | `fit_predict` returns finite predictions of the right shape |
+| screen | the manifest's family-grouped 5 folds | R² ≥ champion − 0.01 |
+| confirm | 10 re-drawn family-grouped 5-fold splits | mean paired ΔR² > 0.005 and Nadeau–Bengio corrected one-sided p < 0.1 |
+| quarantine | — | screen R² > 0.15 stops the run for human review |
+| final (human only) | family-block permutation test, 1000 shuffles | reported, not gated |
+
+## Running
+
+DeepSeek key in `.env` (`DEEPSEEK_API_KEY`); model `deepseek-flash` unless
+`DEEPSEEK_MODEL` or `--model` says otherwise.
+
+```bash
+uv run python -m autoresearch run --tag try1 --budget 30
+```
+
+```bash
+uv run python -m autoresearch status --tag try1
+```
+
+```bash
+uv run python -m autoresearch final --tag try1 --n-perm 1000
+```
+
+A run resumes where it stopped (same `--tag`). Each new champion is committed
+to the branch `autoresearch/<tag>` through a worktree at
+`outputs/autoresearch/<tag>/git/`; your checkout and `main` are never touched.
+Pass `--no-git` to skip the commits. Review the branch and merge by hand.
+
+Run state lives in `outputs/autoresearch/<tag>/` (gitignored): `state.json`,
+`journal.jsonl`, `llm_log.jsonl`, `champions/NNN.py`. Every scored stage is
+appended to `outputs/autoresearch/ledger.jsonl`.
+
+## Tests
+
+```bash
+uv run pytest
+```
+
+Offline: synthetic data (`AUTORESEARCH_SYNTHETIC=1`) and a scripted `FakeLLM`.
+They cover the static checks, the data boundary of `Split`, error scrubbing,
+promotion / debug / quarantine paths, and refusing to resume after the
+harness changed.
