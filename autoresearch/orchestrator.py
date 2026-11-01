@@ -107,7 +107,10 @@ class Run:
             if other["tag"] == self.tag or champion["screen_r2"] <= best_r2:
                 continue
             best_r2 = champion["screen_r2"]
-            best = (path.parent / champion["path"], f"seed: {other['tag']} #{champion['idx']} {champion['title']}")
+            title = champion["title"]  # an inherited seed already names where it came from
+            if not title.startswith("seed: "):
+                title = f"seed: {other['tag']} #{champion['idx']} {title}"
+            best = (path.parent / champion["path"], title)
         return best
 
     def _confirm_seeds(self) -> list[int]:
@@ -290,7 +293,7 @@ def pr_body(summary: dict, state: dict) -> str:
 
 | | screen R² | screen r | screen MAE |
 |---|---|---|---|
-| previous champion: {prev['title']} | {prev['screen_r2']:.4f} | | |
+| previous champion: {prev['title']} | {prev['screen_r2']:.4f} | — | — |
 | **this candidate** | **{screen['r2_mean']:.4f}** ± {screen['r2_std']:.4f} | {screen['r_mean']:.3f} | {screen['mae_mean']:.3f} |
 
 **Confirm stage** (10 re-drawn family-grouped 5-fold splits, paired against the previous champion):
