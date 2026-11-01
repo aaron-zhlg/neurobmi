@@ -8,6 +8,9 @@ autoresearch (one editable file, fixed evaluator, keep or revert), AIDE
 on validation overfitting (separate confirmation stage, idea budget, final
 check only a human can run).
 
+A locked holdout (one fifth of the families, fixed seed) is set aside first;
+agents only ever work on the remaining development set.
+
 ```text
  program.md ─┐
  champion    ├─► Proposer ─► Coder ─► static check ─► smoke ─► screen ─► confirm ─► new champion?
@@ -35,12 +38,22 @@ so a run can be audited for what left the machine.
 
 | Stage | Data | Pass rule |
 |-------|------|-----------|
-| static check | AST of the file | allowed imports only (numpy, scipy, sklearn, stdlib math / functional helpers); no `open` / `eval` / `getattr` / dunders / path literals / numpy file I/O |
+| static check | AST of the file | allowed imports only (numpy, scipy, sklearn, lightgbm, xgboost, stdlib math / functional helpers); no `open` / `eval` / `getattr` / dunders / path literals / numpy file I/O |
 | smoke | synthetic, 300 rows | `fit_predict` returns finite predictions of the right shape |
-| screen | the manifest's family-grouped 5 folds | R² ≥ champion − 0.01 |
-| confirm | 10 re-drawn family-grouped 5-fold splits | mean paired ΔR² > 0.005 and Nadeau–Bengio corrected one-sided p < 0.1 |
+| screen | fixed family-grouped 5 folds of the development set | R² ≥ champion − 0.01 |
+| confirm | 10 re-drawn family-grouped 5-fold splits of the development set | mean paired ΔR² > 0.005 and Nadeau–Bengio corrected one-sided p < 0.1 → new champion |
 | quarantine | — | screen R² > 0.15 stops the run for human review |
-| final (human only) | family-block permutation test, 1000 shuffles | reported, not gated |
+| verify: permutation | screen folds, BMI shuffled between same-size families, 200 shuffles | p < 0.05 |
+| verify: holdout | fit on the development set, score once on the locked holdout, paired family bootstrap against the last verified champion | R² > 0 and ΔR² ≥ 0 |
+
+Only a champion that passes both verify checks gets a PR. Agents never see
+verify results (they are not in the journal), so the holdout cannot steer
+the search; it is touched once per confirmed champion. The first bar of a
+run is the best holdout score among the seed, `neurobmi/candidate.py` and
+champions verified by earlier runs. With about 200 holdout subjects a single
+R² has a wide interval (±0.1), so the paired difference decides and the
+confirm test remains the main evidence of improvement. `final` runs a longer
+permutation test by hand.
 
 ## Running
 
@@ -68,7 +81,7 @@ Each new champion gets its own branch `autoresearch/<tag>-<idea>`, cut from
 `origin/main` in a temporary worktree, with `neurobmi/candidate.py` replaced
 and an aggregate-only `autoresearch/results/<tag>-<idea>.json`. The branch is
 pushed and a PR against `main` is opened with the scores, the confirm-stage
-test and the lineage; a later PR from the same lineage lists the ones it
+test, the verify results and the lineage; a later PR from the same lineage lists the ones it
 supersedes, and a reviewer "suspicious" verdict makes the PR a draft. Your
 checkout is never touched and nothing is merged automatically. Pass
 `--no-pr` to keep champions local.

@@ -19,7 +19,8 @@ Stages:
   permutation  the screen folds with BMI shuffled between same-size families
                (one permutation per seed), for the null distribution of R²
   holdout      fit on the whole development set, score once on the locked holdout,
-               with a family-cluster bootstrap CI. Its numbers never reach an agent.
+               with a family-cluster bootstrap CI; given a reference candidate, also the
+               paired R² difference on the same subjects. Its numbers never reach an agent.
 
 Set AUTORESEARCH_SYNTHETIC=1 to run every stage on synthetic data (tests).
 """
@@ -159,16 +160,20 @@ def family_block_permutation(families: np.ndarray, y: np.ndarray, rng: np.random
     return out
 
 
-def cluster_bootstrap_r2(y: np.ndarray, pred: np.ndarray, families: np.ndarray, n: int = N_BOOTSTRAP) -> list[float]:
-    """95% CI of R² resampling whole families with replacement."""
+def cluster_bootstrap(y: np.ndarray, families: np.ndarray, *preds: np.ndarray, n: int = N_BOOTSTRAP) -> np.ndarray:
+    """R² of each prediction on `n` resamples of whole families with replacement: (n, len(preds))."""
     rng = np.random.default_rng(0)
     fams, inverse = np.unique(families, return_inverse=True)
     members = [np.where(inverse == f)[0] for f in range(len(fams))]
-    scores = []
-    for _ in range(n):
+    scores = np.empty((n, len(preds)))
+    for b in range(n):
         idx = np.concatenate([members[f] for f in rng.integers(0, len(fams), len(fams))])
-        scores.append(fold_metrics(y[idx], pred[idx])["r2"])
-    return [float(np.quantile(scores, 0.025)), float(np.quantile(scores, 0.975))]
+        scores[b] = [fold_metrics(y[idx], pred[idx])["r2"] for pred in preds]
+    return scores
+
+
+def _ci(values: np.ndarray) -> list[float]:
+    return [float(np.quantile(values, 0.025)), float(np.quantile(values, 0.975))]
 
 
 def split(source: Source, idx: np.ndarray, train: bool) -> Split:
@@ -206,17 +211,24 @@ def _predict(module, source: Source, train_idx: np.ndarray, test_idx: np.ndarray
     return pred
 
 
-def evaluate(candidate_path: Path, stage: str, seeds: list[int]) -> list[dict]:
+def evaluate(candidate_path: Path, stage: str, seeds: list[int], reference_path: Path | None = None) -> list[dict]:
     """Per-fold metrics for every seed. Runs in the child process."""
     full = synthetic_source() if stage == "smoke" else load_source()
     locked = holdout_mask(full)
     module = load_candidate(candidate_path)
     if stage == "holdout":
         dev_idx, test_idx = np.where(~locked)[0], np.where(locked)[0]
+        y, families = full.y[test_idx], full.families[test_idx]
         pred = _predict(module, full, dev_idx, test_idx)
-        y = full.y[test_idx]
-        return [{"seed": 0, "fold": 0, "n_test": int(len(test_idx)), **fold_metrics(y, pred),
-                 "r2_ci": cluster_bootstrap_r2(y, pred, full.families[test_idx])}]
+        out = {"seed": 0, "fold": 0, "n_test": int(len(test_idx)), **fold_metrics(y, pred)}
+        if reference_path is None:
+            return [{**out, "r2_ci": _ci(cluster_bootstrap(y, families, pred)[:, 0])}]
+        ref = _predict(load_candidate(reference_path), full, dev_idx, test_idx)
+        boot = cluster_bootstrap(y, families, pred, ref)
+        delta = boot[:, 0] - boot[:, 1]
+        return [{**out, "r2_ci": _ci(boot[:, 0]), "reference_r2": fold_metrics(y, ref)["r2"],
+                 "delta_r2": out["r2"] - fold_metrics(y, ref)["r2"], "delta_ci": _ci(delta),
+                 "p_not_better": float(np.mean(delta <= 0))}]
     dev = full if stage == "smoke" else full.subset(~locked)
     folds_out = []
     for seed in seeds:
@@ -249,7 +261,8 @@ def scrub_error(exc: BaseException, candidate_path: Path) -> str:
 # ---------------------------------------------------------------- parent API
 
 
-def run_stage(candidate_path: Path, stage: str, seeds: list[int] | None = None, timeout: int | None = None) -> dict:
+def run_stage(candidate_path: Path, stage: str, seeds: list[int] | None = None, timeout: int | None = None,
+              reference: Path | None = None) -> dict:
     """Run one stage in child processes (seeds split across `workers`).
 
     Returns {"ok", "folds"|"error", "summary", "seconds"}. The timeout applies to
@@ -266,7 +279,7 @@ def run_stage(candidate_path: Path, stage: str, seeds: list[int] | None = None, 
     chunks = [seeds[i::workers] for i in range(workers)]
     started = time.monotonic()
     procs = [subprocess.Popen([sys.executable, "-m", "autoresearch.harness", "child", str(candidate_path), stage,
-                               ",".join(map(str, chunk))], cwd=ROOT, env=env, stdout=subprocess.PIPE,
+                               ",".join(map(str, chunk)), *([str(reference)] if reference else [])], cwd=ROOT, env=env, stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL, text=True) for chunk in chunks]
     outputs = []
     try:
@@ -324,14 +337,14 @@ def append_ledger(path: Path, row: dict) -> None:
 # ---------------------------------------------------------------- child entry point
 
 
-def _child(candidate_path: Path, stage: str, seeds: list[int]) -> None:
+def _child(candidate_path: Path, stage: str, seeds: list[int], reference: Path | None = None) -> None:
     sink = io.StringIO()
     try:
         with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
             import warnings
 
             warnings.simplefilter("ignore")
-            result = {"ok": True, "folds": evaluate(candidate_path, stage, seeds)}
+            result = {"ok": True, "folds": evaluate(candidate_path, stage, seeds, reference)}
     except BaseException as exc:  # noqa: BLE001 - anything a candidate raises is reported, not propagated
         result = {"ok": False, "error": scrub_error(exc, candidate_path)}
     sys.__stdout__.write("AUTORESEARCH_RESULT " + json.dumps(result) + "\n")
@@ -344,8 +357,10 @@ def main() -> None:
     child.add_argument("candidate", type=Path)
     child.add_argument("stage", choices=("smoke", "screen", "confirm", "permutation", "holdout"))
     child.add_argument("seeds")
+    child.add_argument("reference", type=Path, nargs="?", default=None)
     args = parser.parse_args()
-    _child(args.candidate.resolve(), args.stage, [int(s) for s in args.seeds.split(",")])
+    _child(args.candidate.resolve(), args.stage, [int(s) for s in args.seeds.split(",")],
+           args.reference.resolve() if args.reference else None)
 
 
 if __name__ == "__main__":

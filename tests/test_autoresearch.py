@@ -49,7 +49,8 @@ def write(code: str, call_id: str = "c1") -> dict:
 
 
 VERIFY = {"permutation": {"ok": True, "n_perm": 200, "p_value": 0.005, "null_mean": 0.0, "null_95th": 0.02},
-          "holdout": {"r2": 0.07, "r": 0.28, "mae": 3.9, "r2_ci": [0.02, 0.12], "n_test": 208},
+          "holdout": {"r2": 0.07, "r": 0.28, "mae": 3.9, "r2_ci": [0.02, 0.12], "n_test": 208, "reference_r2": 0.06,
+                      "delta_r2": 0.01, "delta_ci": [-0.01, 0.03], "p_not_better": 0.2},
           "bar": {"title": "ridge", "r2": 0.06}, "failed": [], "passed": True}
 REVIEW = {"content": json.dumps({"verdict": "ok", "concerns": "", "insight": "noted"})}
 
@@ -108,7 +109,15 @@ def test_champion_failing_holdout_is_not_published(tmp_path):
     run.gates.update(plausibility_r2=1.0)
     run.gates["confirm"]["repeats"] = 2
     state = run.load()
-    state["verified"]["r2"] = 0.99  # an earlier champion that the holdout cannot beat
+    strong = tmp_path / "v" / "champions" / "strong.py"  # an earlier champion the candidate cannot beat
+    oracle = """import numpy as np
+
+
+def fit_predict(train, test):
+    return 27 + 0.8 * test.X[:, :10].sum(axis=1)
+"""
+    strong.write_text(oracle)
+    state["verified"]["path"] = "champions/strong.py"
     run.save(state)
     state = run.run(budget=1)
     assert run.journal()[0]["outcome"] == "new_champion" and not published

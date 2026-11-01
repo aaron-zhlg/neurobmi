@@ -10,7 +10,8 @@ No LLM decides control flow. State lives in outputs/autoresearch/<tag>/:
 
 Each new champion is first verified without any agent seeing the numbers: a
 family-block permutation test on the development set and one score on the
-locked holdout, which must not fall below the last verified champion's. Only a
+locked holdout, paired against the last verified champion on the same
+subjects; the holdout R² must be above 0 and not below that champion's. Only a
 verified champion is pushed to its own branch autoresearch/<tag>-<idea> (cut
 from origin/main through a temporary worktree) and opened as a PR against main;
 a flagged reviewer verdict makes it a draft, and the branch tip is published as a
@@ -88,19 +89,42 @@ class Run:
         self.log(f"[{self.tag}] scoring {seed_title}")
         screen = self._stage(champion_path, "screen", [0], idea=0, title=seed_title)
         confirm = self._stage(champion_path, "confirm", self._confirm_seeds(), idea=0, title=seed_title)
-        holdout = self._stage(champion_path, "holdout", [0], idea=0, title=seed_title)
-        if not (screen["ok"] and confirm["ok"] and holdout["ok"]):
-            raise RuntimeError(f"seed champion failed: {screen.get('error') or confirm.get('error') or holdout.get('error')}")
+        if not (screen["ok"] and confirm["ok"]):
+            raise RuntimeError(f"seed champion failed: {screen.get('error') or confirm.get('error')}")
         state = {
             "tag": self.tag, "created": time.time(), "hashes": protected_hashes(), "ideas_used": 0,
             "champion": {"idx": 0, "path": str(champion_path.relative_to(self.dir)), "title": seed_title,
                          "screen_r2": screen["summary"]["r2_mean"], "confirm_folds": confirm["folds"]},
             "history": [{"idx": 0, "title": seed_title, "screen_r2": screen["summary"]["r2_mean"]}],
             # the bar a new champion's holdout score must reach before it gets a PR
-            "verified": {"idx": 0, "title": seed_title, **_holdout_summary(holdout)},
+            "verified": self._initial_bar(champion_path, seed_title),
         }
         self.save(state)
         return state
+
+    def _initial_bar(self, seed_path: Path, seed_title: str) -> dict:
+        """Holdout bar for this run: the best of the seed, neurobmi/candidate.py on main, and every
+        champion an earlier run verified. A seed from before verification existed may score below
+        the merged baseline on the holdout, and must not lower the bar."""
+        options = [(seed_path, seed_title), (SEED_CANDIDATE, "neurobmi/candidate.py")]
+        for path in sorted(self.output_root.glob("*/state.json")):
+            other = json.loads(path.read_text(encoding="utf-8"))
+            if other["tag"] != self.tag and other.get("verified", {}).get("idx"):
+                bar = other["verified"]
+                options.append((path.parent / bar["path"], f"{other['tag']} #{bar['idx']} {bar['title']}"))
+        best = None
+        for path, title in options:
+            result = self._stage(path, "holdout", [0], idea=0, title=f"bar: {title}")
+            if not result["ok"]:
+                raise RuntimeError(f"holdout bar {title} failed: {result['error']}")
+            summary = _holdout_summary(result)
+            if best is None or summary["r2"] > best[2]["r2"]:
+                best = (path, title, summary)
+        path, title, summary = best
+        bar_path = self.dir / "champions" / "bar.py"
+        shutil.copy(path, bar_path)
+        self.log(f"[{self.tag}] holdout bar: {title}")
+        return {"idx": 0, "title": title, "path": str(bar_path.relative_to(self.dir)), **summary}
 
     def _best_seed(self) -> tuple[Path, str]:
         """Best champion of any earlier run (by its recorded screen R²), else neurobmi/candidate.py.
@@ -125,8 +149,9 @@ class Run:
     def _confirm_seeds(self) -> list[int]:
         return list(range(1, self.gates["confirm"]["repeats"] + 1))
 
-    def _stage(self, path: Path, stage: str, seeds: list[int], idea: int, title: str) -> dict:
-        result = run_stage(path, stage, seeds)
+    def _stage(self, path: Path, stage: str, seeds: list[int], idea: int, title: str,
+               reference: Path | None = None) -> dict:
+        result = run_stage(path, stage, seeds, reference=reference)
         if stage != "smoke":
             append_ledger(self.ledger_path, {"tag": self.tag, "idea": idea, "title": title, "stage": stage,
                                         "ok": result["ok"], "summary": result.get("summary"),
@@ -255,8 +280,8 @@ class Run:
         n_perm = int(os.environ.get("AUTORESEARCH_N_PERM", self.gates["permutation"]["n_perm"]))
         self.log(f"[{self.tag}] verifying #{entry['idea']}: {n_perm} permutations + locked holdout")
         perm = permutation_test(path, n_perm, observed_r2=champion["screen_r2"])
-        holdout = self._stage(path, "holdout", [0], entry["idea"], champion["title"])
         bar = state["verified"]
+        holdout = self._stage(path, "holdout", [0], entry["idea"], champion["title"], reference=self.dir / bar["path"])
         verify = {"permutation": perm, "holdout": _holdout_summary(holdout) if holdout["ok"] else holdout,
                   "bar": bar, "failed": []}
         if not perm["ok"]:
@@ -266,15 +291,17 @@ class Run:
         if not holdout["ok"]:
             verify["failed"].append(f"holdout crashed: {holdout['error']}")
         else:
-            h = verify["holdout"]
-            if h["r2_ci"][0] <= self.gates["holdout"]["min_ci_low"]:
-                verify["failed"].append(f"holdout R2 CI includes 0 ({h['r2_ci'][0]:.4f})")
-            if h["r2"] < bar["r2"]:
-                verify["failed"].append(f"holdout R2 {h['r2']:.4f} below last verified champion {bar['r2']:.4f}")
+            h, gate = verify["holdout"], self.gates["holdout"]
+            if h["r2"] <= gate["min_r2"]:
+                verify["failed"].append(f"holdout R2 {h['r2']:.4f} not above {gate['min_r2']}")
+            if h["delta_r2"] < gate["min_delta"]:
+                verify["failed"].append(f"holdout R2 {h['r2']:.4f} below last verified champion "
+                                        f"{h['reference_r2']:.4f}")
         verify["passed"] = not verify["failed"]
         state["history"][-1]["verify"] = verify
         if verify["passed"]:
-            state["verified"] = {"idx": entry["idea"], "title": champion["title"], **verify["holdout"]}
+            state["verified"] = {"idx": entry["idea"], "title": champion["title"], "path": champion["path"],
+                                 **{k: v for k, v in verify["holdout"].items() if k in ("r2", "r", "mae", "r2_ci", "n_test")}}
         self.save(state)
         self.log(f"[{self.tag}] #{entry['idea']} " + ("verified" if verify["passed"] else
                                                       "not published: " + "; ".join(verify["failed"])))
@@ -337,7 +364,8 @@ class Run:
 
 def _holdout_summary(result: dict) -> dict:
     fold = result["folds"][0]
-    return {k: fold[k] for k in ("r2", "r", "mae", "r2_ci", "n_test")}
+    keys = ("r2", "r", "mae", "r2_ci", "n_test", "reference_r2", "delta_r2", "delta_ci", "p_not_better")
+    return {k: fold[k] for k in keys if k in fold}
 
 
 def verification_section(verify: dict) -> str:
@@ -348,8 +376,11 @@ def verification_section(verify: dict) -> str:
 | check | result | pass rule |
 |---|---|---|
 | family-block permutation test, {perm['n_perm']} shuffles (development set) | p = {perm['p_value']:.3g} (null mean R² {perm['null_mean']:.4f}, 95th pct {perm['null_95th']:.4f}) | p < 0.05 |
-| **locked holdout** ({h['n_test']} subjects, never used for any choice) | **R² = {h['r2']:.4f}**, 95% CI [{h['r2_ci'][0]:.4f}, {h['r2_ci'][1]:.4f}], r = {h['r']:.3f} | CI above 0 |
-| holdout vs last verified champion ({bar['title']}) | {h['r2']:.4f} vs {bar['r2']:.4f} | not lower |"""
+| **locked holdout** ({h['n_test']} subjects, never seen by any agent) | **R² = {h['r2']:.4f}**, family-bootstrap 95% CI [{h['r2_ci'][0]:.4f}, {h['r2_ci'][1]:.4f}], r = {h['r']:.3f} | R² > 0 |
+| holdout, paired vs last verified champion ({bar['title']}) | ΔR² = {h['delta_r2']:+.4f}, 95% CI [{h['delta_ci'][0]:+.4f}, {h['delta_ci'][1]:+.4f}] ({h['reference_r2']:.4f} → {h['r2']:.4f}) | ΔR² ≥ 0 |
+
+The holdout has about 200 subjects, so a single R² carries a wide interval; the paired difference
+is what decides, and the development-set confirm test above is the main evidence of improvement."""
 
 
 def release_name(tag: str, idea: int) -> str:

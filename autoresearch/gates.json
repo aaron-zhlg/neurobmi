@@ -25,7 +25,8 @@
   },
   "holdout": {
     "timeout_seconds": 600,
-    "min_ci_low": 0.0
+    "min_r2": 0.0,
+    "min_delta": 0.0
   },
   "draft_every": 3
 }

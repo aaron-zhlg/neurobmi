@@ -2,7 +2,7 @@
 
     uv run python -m autoresearch run --tag try1 [--budget 30] [--no-pr] [--fresh]
     uv run python -m autoresearch status --tag try1
-    uv run python -m autoresearch final --tag try1 [--n-perm 1000]   # human only
+    uv run python -m autoresearch final --tag try1 [--n-perm 1000]   # longer permutation test
     uv run python -m autoresearch score neurobmi/candidate.py [--stage confirm]
     uv run python -m autoresearch release --tag try1 --idea 24       # backfill a GitHub release
 """
@@ -29,7 +29,7 @@ def main() -> None:
                      help="seed from neurobmi/candidate.py instead of the best champion of earlier runs")
     st = sub.add_parser("status", help="summarize a run")
     st.add_argument("--tag", required=True)
-    fin = sub.add_parser("final", help="family-block permutation test of a run's champion (human only)")
+    fin = sub.add_parser("final", help="longer family-block permutation test of a run's champion")
     fin.add_argument("--tag", required=True)
     fin.add_argument("--n-perm", type=int, default=1000)
     sc = sub.add_parser("score", help="score a candidate file with the harness (reproduce a result)")
