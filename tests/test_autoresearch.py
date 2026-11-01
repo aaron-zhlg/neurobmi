@@ -112,6 +112,30 @@ def test_loop_quarantines_implausible_scores(tmp_path):
     assert len(journal) == 1 and journal[0]["outcome"] == "quarantined"
 
 
+def test_agent_errors_are_journaled_and_stop_the_run(tmp_path):
+    bad_json = {"content": "not json"}
+    llm = FakeLLM([bad_json] * 9)  # proposer fails 3 times per idea (1 try + 2 retries)
+    run = orchestrator.Run("e", llm, use_git=False, log=lambda *_: None, output_root=tmp_path)
+    run.gates["confirm"]["repeats"] = 2
+    state = run.run(budget=10)
+    assert [e["outcome"] for e in run.journal()] == ["agent_error"] * 3
+    assert state["ideas_used"] == 3
+
+
+def test_resume_continues_numbering(tmp_path):
+    run = orchestrator.Run("r", FakeLLM([card("a"), write(GOOD_CODE), REVIEW]), use_git=False,
+                           log=lambda *_: None, output_root=tmp_path)
+    run.gates.update(plausibility_r2=1.0)
+    run.gates["confirm"]["repeats"] = 2
+    run.run(budget=1)
+    again = orchestrator.Run("r", FakeLLM([card("b"), write(GOOD_CODE), REVIEW]), use_git=False,
+                             log=lambda *_: None, output_root=tmp_path)
+    again.gates.update(plausibility_r2=1.0)
+    again.gates["confirm"]["repeats"] = 2
+    state = again.run(budget=2)
+    assert [e["idea"] for e in again.journal()] == [1, 2] and state["ideas_used"] == 2
+
+
 def test_resume_refuses_changed_harness(tmp_path):
     llm = FakeLLM([])
     run = orchestrator.Run("h", llm, use_git=False, log=lambda *_: None, output_root=tmp_path)

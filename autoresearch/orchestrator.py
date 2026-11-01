@@ -106,18 +106,32 @@ class Run:
     def run(self, budget: int | None = None) -> dict:
         state = self.load()
         budget = budget if budget is not None else self.gates["idea_budget"]
+        agent_errors = 0
         while state["ideas_used"] < budget:
             if state["hashes"] != protected_hashes():
                 raise RuntimeError("protected harness files changed during the run; stopping")
-            state["ideas_used"] += 1
-            self.save(state)
-            entry = self.trial(state, idea=state["ideas_used"], budget_left=budget - state["ideas_used"])
+            idea = state["ideas_used"] + 1
+            # An interrupted idea (Ctrl-C) is not counted and is retried on resume.
+            try:
+                entry = self.trial(state, idea=idea, budget_left=budget - idea)
+                agent_errors = 0
+            except Exception as exc:  # noqa: BLE001 - API / malformed-reply failures must not kill the run
+                agent_errors += 1
+                entry = {"idea": idea, "operator": "?", "title": "(agent error)", "hypothesis": "",
+                         "outcome": "agent_error", "screen_r2": None, "error": f"{type(exc).__name__}: {exc}"[:400],
+                         "at": time.time()}
             with self.journal_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(entry) + "\n")
+            state["ideas_used"] = idea
+            self.save(state)
             self.log(f"[{self.tag}] idea {entry['idea']}: {entry['title']!r} -> {entry['outcome']}"
-                     + (f" (screen R2 {entry['screen_r2']:.4f})" if entry.get("screen_r2") is not None else ""))
+                     + (f" (screen R2 {entry['screen_r2']:.4f})" if entry.get("screen_r2") is not None else "")
+                     + (f" [{entry['error']}]" if entry["outcome"] == "agent_error" else ""))
             if entry["outcome"] == "quarantined":
                 self.log(f"[{self.tag}] stopping: implausible score needs human review")
+                break
+            if agent_errors >= 3:
+                self.log(f"[{self.tag}] stopping: 3 agent errors in a row (check the API key / network)")
                 break
         return state
 
